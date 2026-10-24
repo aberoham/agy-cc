@@ -121,11 +121,14 @@ They show the plugin handles agy's recorded behaviour, not that a live model
 still behaves that way.
 
 For that, run `scripts/live-smoke.sh --apply` from the source repository on a
-machine where agy is signed in. It runs every command against the real agy in
-a throwaway repository, checks the results, and prints the approval-round
-table. It uses your Gemini licence, so without `--apply` it only lists the
-steps. `--with-claude` also drives `/agy:setup` and `/agy:review` through
-`claude --plugin-dir`.
+machine where agy is signed in. In a throwaway repository it runs the
+companion's setup, review, adversarial review, plan, task, resume, result,
+apply check and cancel against the real agy, checks each result, and prints
+the approval-round table. `/agy:rescue` itself is not run: it is a Claude
+subagent that calls the same `task` command. Code agy wrote runs only under a
+write sandbox, so on Linux those checks are skipped. It uses your Gemini
+licence, so without `--apply` it only lists the steps. `--with-claude` also
+drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
 
 ## Gotchas
 

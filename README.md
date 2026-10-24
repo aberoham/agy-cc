@@ -19,6 +19,6 @@ uv run --no-project --python 3.9 --with 'pytest>=8.4,<10' pytest -q
 
 Try it locally with `claude --plugin-dir plugins/agy`. Before a release, run
 `scripts/live-smoke.sh --apply` on a machine where agy is signed in; it checks
-every command against the real agy.
+the companion's commands against the real agy.
 
 Licensed under the Apache License 2.0. See [NOTICE](NOTICE) for the parts adapted from OpenAI's codex-plugin-cc.
