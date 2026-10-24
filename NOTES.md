@@ -158,6 +158,18 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   Default Credentials file is an `authorized_user` credential with a refresh
   token, not a workforce federation credential, so the seat-or-pay-as-you-go
   question for ADC stays open.
+- **The agy sign-in file is a session credential, not an indefinite refresh
+  token.** The token file records `auth_method: gcp` and a `wif_provider`
+  under the workforce pool `thg-bootstrap`, whose `sessionDuration` is
+  `28800s` (eight hours; read with `gcloud iam workforce-pools describe`).
+  Google's documentation says the pool's session duration bounds gcloud
+  sign-in sessions, and that a refresh token expires with the session length
+  and the user must sign in again
+  ([reauthentication](https://docs.cloud.google.com/docs/authentication/reauthentication),
+  [extended session length](https://docs.cloud.google.com/access-context-manager/docs/extended-session-length-for-workforce-identity-federation)).
+  So a copy of the file, in the container home or anywhere else, works for
+  at most eight hours after the sign-in. Abe accepted the copy on that basis
+  on 24 October 2026.
 
 ## Alternative backend: the Antigravity Python SDK
 

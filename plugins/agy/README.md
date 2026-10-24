@@ -96,8 +96,9 @@ What the container does not change: agy still has the network, because it
 must reach Google, so a prompt injection in the repository can send the
 repository's contents out. The repository already goes to Google for the
 review, so the loss is bounded to the repository, but it is not zero. The
-container sign-in is a refresh token in the container home, a long-lived
-secret like the one in your own `~/.gemini`. And a Docker virtual machine on
+container sign-in in the container home is a credential like the one in
+your own `~/.gemini`; with workforce identity federation it expires with the
+pool's session duration (see `NOTES.md`). And a Docker virtual machine on
 macOS shares only some directories: the plugin's state directory and the
 container home must be under your home (Colima's default share), which
 `/agy:setup` checks.
@@ -233,11 +234,11 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
 
 ## Open questions
 
-- **Container sign-in.** `containers/signin.sh` stores agy's refresh token
-  in the container home, a long-lived secret. `AGY_ADC_AUTH=true`
-  (preview) with Application Default Credentials from workforce identity
-  federation would be short-lived; whether it bills the Gemini Enterprise
-  seat or pay-as-you-go is not verified.
+- **Container sign-in.** `containers/signin.sh` stores agy's sign-in in the
+  container home, so a container user signs in twice, once per home, and
+  again when the pool's session expires. `AGY_ADC_AUTH=true` (preview) with
+  Application Default Credentials would avoid the second sign-in; whether it
+  bills the Gemini Enterprise seat or pay-as-you-go is not verified.
 - **Host mode's future.** Once container mode has run live for a while, the
   host-side policy, sandbox and `/agy:resume` loop are due for removal.
 - **The Antigravity Python SDK** offers real permission callbacks, but it
