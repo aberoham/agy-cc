@@ -284,8 +284,14 @@ def main() -> int:
     if scenario == "container":
         # A task inside a container: edits stats.py, runs the repository's own
         # hooks through run_command, and follows probe instructions in the
-        # request so a test can see what the container can reach.
+        # request so a test can see what the container can reach. Like agy,
+        # it keeps the conversation under $HOME and cannot resume without it.
+        conversations = Path.home() / ".gemini" / "antigravity-cli" / "conversations"
         if "--conversation" in argv:
+            if not (conversations / f"{conversation}.db").is_file():
+                sys.stderr.write(f'warning: conversation "{conversation}" not found\n')
+                result(conversation, "", status="ERROR", error="conversation not found; started a new one")
+                return 0
             try:
                 (cwd / "stats.py").write_text("resumed\n")
                 result(conversation, "Continued and wrote stats.py.")
@@ -303,6 +309,8 @@ def main() -> int:
                 (cwd / ".gitattributes").write_text("*.py filter=x\n")
                 subprocess.run(["git", "config", "filter.x.clean", f"touch {words[1]}"], cwd=cwd, check=True)
                 notes.append(f"filter set to touch {words[1]}")
+        conversations.mkdir(parents=True, exist_ok=True)
+        (conversations / f"{conversation}.db").write_text("conversation state\n")
         (cwd / "stats.py").write_text("fixed\n")
         tool_step(conversation, 1, "write_file", {"Path": str(cwd / "stats.py")}, {"decision": "allow"})
         decision = run_hook(cwd, conversation, brain, "run_command", {"CommandLine": "make test", "Cwd": str(cwd)})

@@ -56,3 +56,13 @@ def test_plugin_carries_licence_and_notice():
     assert (PLUGIN / "LICENSE").read_text() == (REPO / "LICENSE").read_text()
     notice = (PLUGIN / "NOTICE").read_text()
     assert "codex-plugin-cc" in notice and "Modifications" in notice
+
+
+def test_signin_script_calls_functions_that_exist():
+    from agylib import container
+
+    script = (REPO / "containers" / "signin.sh").read_text(encoding="utf-8")
+    names = re.findall(r"container\.(\w+)\(", script)
+    assert names
+    for name in names:
+        assert hasattr(container, name), f"containers/signin.sh calls container.{name}, which does not exist"

@@ -12,7 +12,7 @@ FROM debian:bookworm-slim
 
 COPY certs/ /usr/local/share/ca-certificates/
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl git jq python3 \
+    && apt-get install -y --no-install-recommends ca-certificates curl git jq procps python3 \
     && update-ca-certificates \
     && apt-get clean
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \

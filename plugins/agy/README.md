@@ -22,8 +22,8 @@ works on its own copy of your repository, so agy never edits your checkout.
   `containers/signin.sh`. Without them the plugin falls back to host mode,
   described below. The image carries `git`, `curl`, `jq`, `python3` and `uv`,
   so agy can run a Python repository's tests; add what your repositories
-  need to the Dockerfile. uv's cache lives in the container home, so it
-  persists across jobs.
+  need to the Dockerfile. Each job starts with an empty uv cache, so a job
+  downloads what it needs.
 
 ## Install
 
@@ -70,14 +70,21 @@ the patch format so your diff and colour settings cannot break it.
 
 ### Container mode
 
-agy runs in a Linux container (`containers/Dockerfile`) that can see four
+agy runs in a Linux container (`containers/Dockerfile`) that can see three
 things, each mounted at its host path: the working copy, one subdirectory of
-the job's state directory (for agy's log and the exported patch), the
-plugin's own files (read-only) and a separate agy home
-(`~/.gemini/agy-container-home`) that holds the container sign-in. Nothing
-else from your machine is mounted, so there is no `~/.aws`, `~/.ssh` or
-keychain to read, and the job record, the baseline snapshot and the result,
-which the host trusts, are out of the container's reach.
+the job's state directory (agy's log, the exported patch and the job's own
+home) and the plugin's own files (read-only). Nothing else from your machine
+is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read, and the
+job record, the baseline snapshot and the result, which the host trusts, are
+out of the container's reach. The job's home belongs to that job alone: it
+starts empty, receives a copy of the container sign-in and settings from
+`~/.gemini/agy-container-home` (which is never mounted into a job) at the
+start of every round, and keeps agy's conversation between rounds so a
+resume works. A job therefore cannot leave a setting, a hook or a cached
+package behind for the next job, whatever repository it was reviewing. The
+patch export runs with an empty home, python in isolated mode and no user
+git configuration, so nothing a round planted in the job's home runs there.
+A `--read-dir` that overlaps the sign-in or the state directory is refused.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs
 the commands it needs, including your tests, and edits what it likes, and
 all of that lands in the working copy. For a review, a plan or a task round
@@ -111,14 +118,13 @@ used, so `NOTICE` is unchanged.
 What the container does not change: agy still has the network, because it
 must reach Google, so a prompt injection in the repository can send out
 anything the container can read: the repository, any `--read-dir`
-directory, and the container sign-in in the container home. The repository
+directory, and the job's copy of the container sign-in. The repository
 already goes to Google for the review, so that part is not new, but it is
 not nothing. The container sign-in is a credential like the one in your own
 `~/.gemini`; with workforce identity federation it expires with the pool's
 session duration (see `NOTES.md`). And a Docker virtual machine on
-macOS shares only some directories: the plugin's state directory and the
-container home must be under your home (Colima's default share), which
-`/agy:setup` checks.
+macOS shares only some directories: the plugin's state directory must be
+under your home (Colima's default share), which `/agy:setup` checks.
 
 ### Host mode
 
@@ -223,8 +229,8 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
   relaying them, and says which it checked.
 - **Plans go to agy's artifact directory.** In plan mode agy writes
   `implementation_plan.md` under `~/.gemini/antigravity-cli/brain/<id>/` (for
-  a container job, under the container home); its reply only summarises it.
-  `/agy:result` shows the file.
+  a container job, under the job's own home in its state directory); its
+  reply only summarises it. `/agy:result` shows the file.
 - **Resumes cost tokens.** A resumed conversation carries its history, so
   each approval round costs more input tokens than the last.
 - **`--wait` returns after 100 seconds** with the job still running in the
@@ -251,8 +257,8 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
 
 ## Open questions
 
-- **Container sign-in.** `containers/signin.sh` stores agy's sign-in in the
-  container home, so a container user signs in twice, once per home, and
+- **Container sign-in.** `containers/signin.sh` stores agy's sign-in in
+  `~/.gemini/agy-container-home`, so a container user signs in twice, and
   again when the pool's session expires. `AGY_ADC_AUTH=true` (preview) with
   Application Default Credentials would avoid the second sign-in; whether it
   bills the Gemini Enterprise seat or pay-as-you-go is not verified.

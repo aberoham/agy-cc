@@ -194,6 +194,30 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   round with no queued commands. Earlier the same request had ended with
   "No module named pytest".
 
+- Per-job home (24 October 2026): a side review pointed out that every
+  container job mounted the same writable home, so a hostile branch could
+  leave a setting, a hook or a cached package for every later job on any
+  repository. Sandcastle avoids this by construction: its HOME is image-local
+  and dies with the container, credentials arrive as environment variables,
+  and caches are an explicit opt-in mount shown read-only. Jobs now get a
+  home seeded from the sign-in home at the start of every round, and the
+  sign-in home is mounted only by `containers/signin.sh`, never into a job.
+- **The agy review of that change found what Codex and Claude missed**
+  (24 October 2026, adversarial review in container mode, 19 minutes, one
+  stall from medium to low, 703,908 tokens): the first version wiped the
+  job's home at every round, which deleted
+  `conversations/<id>.db`, so `--resume-last` would have silently started a
+  new conversation (agy prints `warning: conversation "<id>" not found` and
+  continues with a new id). The fake agy had not modelled that file. Codex
+  verified the wipe as specified instead of questioning it. agy also raised
+  the named-pipe hang in the host's log and plan reads, start-up files a
+  read-only round could plant for the export container, `--read-dir`
+  overlapping the sign-in home, and `procps` missing from the image; all
+  applied. Its claim that the symlinked-home case was rejected was wrong in
+  detail but pointed at a real gap (agy may report the resolved path).
+  Known and not fixed: concurrent job containers share Docker's default
+  bridge network.
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)

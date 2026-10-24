@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -170,11 +171,8 @@ def _follow(
             limit = tool_stall_seconds if active_tools else stall_seconds
             if now - last_event > limit:
                 return TurnOutcome("stall", f"no agy event for {int(limit)} s", result)
-            if log_path.exists():
-                with open(log_path, "rb") as log:
-                    log.seek(log_offset)
-                    chunk = log.read().decode("utf-8", errors="replace")
-                    log_offset = log.tell()
+            chunk, log_offset = _read_log_chunk(log_path, log_offset)
+            if chunk:
                 match = agybin.STALL_LOG_PATTERN.search(chunk)
                 if match and result is None:
                     return TurnOutcome("stall", f"agy log: {match.group(0)}", result)
@@ -190,6 +188,33 @@ def _follow(
     if result is not None:
         return TurnOutcome("result", str(result.get("status", "")), result)
     return TurnOutcome("exited", f"agy exited with code {proc.returncode} and no result", None)
+
+
+def _open_regular(path: str | Path) -> int | None:
+    """Open a regular file for reading without following a final link or blocking on a special file.
+
+    agy writes the log and the plan artifact, so either could be replaced
+    by a link or a named pipe; a pipe would hang the worker in open(2).
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _read_log_chunk(log_path: Path, offset: int) -> tuple[str, int]:
+    """New text in agy's log since offset, and the new offset."""
+    fd = _open_regular(log_path)
+    if fd is None:
+        return "", offset
+    with os.fdopen(fd, "rb") as log:
+        log.seek(offset)
+        chunk = log.read().decode("utf-8", errors="replace")
+        return chunk, log.tell()
 
 
 class JobRunner:
@@ -282,10 +307,21 @@ class JobRunner:
             return container.job_mount(self.dir) / "agy.log"
         return self.dir / "agy.log"
 
+    def _plan_anchor(self) -> tuple[Path, Path]:
+        """(trusted directory, brain directory relative to it) for plan artifacts.
+
+        The trusted directory is one agy cannot alter: the job's mounted
+        subdirectory for a container job, the user's home for a host job.
+        Everything below it is agy-written and is checked for links.
+        """
+        if self.job.get("isolation") == "container":
+            return container.job_mount(self.dir), Path("home") / ".gemini" / "antigravity-cli" / "brain"
+        return Path.home(), Path(".gemini") / "antigravity-cli" / "brain"
+
     def _plan_root(self) -> str:
         """Where a plan artifact may be read from: agy's brain directory for the job's home."""
-        home = container.agy_home() if self.job.get("isolation") == "container" else Path.home()
-        return str(home / ".gemini" / "antigravity-cli" / "brain") + os.sep
+        trusted, brain = self._plan_anchor()
+        return str(trusted / brain) + os.sep
 
     def _stop_container(self) -> None:
         name = self._container_name()
@@ -335,6 +371,8 @@ class JobRunner:
         started = time.monotonic()
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         usage_total: dict[str, int] = {}
+        if self.job.get("isolation") == "container":
+            container.seed_home(self.dir)  # a fresh home for this round, from the sign-in
 
         while True:
             self.step_usage = {}
@@ -488,18 +526,29 @@ class JobRunner:
     def _read_plan(self, path: Path) -> str | None:
         """The plan artifact's text, or None unless the file really sits under the brain directory.
 
-        agy writes the brain directory, so a link planted there could point
-        at any file the host user can read. The real path must stay inside
-        the real brain directory (so a home behind a symlink still works),
-        and the file is opened without following a final link.
+        agy writes everything below the trusted directory, so a link planted
+        anywhere in that part of the path, the brain directory itself
+        included, could point at any file the host user can read. The path
+        must lie under the brain directory, no component below the trusted
+        directory may be a link (the trusted part may: a home behind a
+        symlink still works), and the file is opened without following a
+        final link.
         """
-        root = os.path.realpath(self._plan_root())
-        real = os.path.realpath(path)
-        if not real.startswith(root + os.sep):
+        trusted, brain = self._plan_anchor()
+        wanted = os.path.normpath(str(path))
+        real_trusted = os.path.realpath(str(trusted))
+        # agy may report the path through the trusted directory's real name.
+        for base in {os.path.normpath(str(trusted)), real_trusted}:
+            root = os.path.join(base, str(brain))
+            if wanted.startswith(root + os.sep):
+                relative = os.path.relpath(wanted, base)
+                break
+        else:
             return None
-        try:
-            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
+        if os.path.realpath(wanted) != os.path.join(real_trusted, relative):
+            return None  # a link somewhere below the trusted directory
+        fd = _open_regular(wanted)
+        if fd is None:
             return None
         with os.fdopen(fd, "rb") as handle:
             return handle.read().decode("utf-8", errors="replace")
@@ -518,7 +567,9 @@ class JobRunner:
         name = f"{self._container_name()}-export"
         # The export stages agy's edits in the copy's own index, so it needs
         # the copy writable even after a read-only round.
-        command = container.export_command(self.job["baseline"], name=name, mounts=self._mounts(writable=True))
+        command = container.export_command(
+            self.job["baseline"], name=name, mounts=self._mounts(writable=True), home=container.export_home(self.dir)
+        )
         self.store.update(self.job_id, lambda r: r.update({"container": name}))
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
