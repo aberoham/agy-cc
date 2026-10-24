@@ -169,7 +169,18 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   [extended session length](https://docs.cloud.google.com/access-context-manager/docs/extended-session-length-for-workforce-identity-federation)).
   So a copy of the file, in the container home or anywhere else, works for
   at most eight hours after the sign-in. Abe accepted the copy on that basis
-  on 24 October 2026.
+  on 24 October 2026. Confirmed the same evening: the host sign-in was from
+  about 10:40, and at 18:40:45 jobs in both homes failed at once with
+  `oauth2: "invalid_grant" "Refresh token has expired"` in `agy.log`
+  (reported by the companion as "authentication failed or timed out"). A
+  host `agy` sign-in and `containers/signin.sh` are both needed again after
+  that.
+- Final-head live runs (commit 823252b, 24 October 2026, both smokes at
+  once): container mode passed every step up to and including apply, and
+  its cancel step failed only because the session expired while the
+  background plan was starting; host mode passed review, adversarial review
+  and plan, and its task, apply and cancel steps hit the same expiry. Rerun
+  both smokes after signing in again before relying on them.
 
 ## Alternative backend: the Antigravity Python SDK
 
