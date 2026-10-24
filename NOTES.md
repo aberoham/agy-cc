@@ -153,8 +153,10 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   task 25 s, apply check, cancel with no container left).
 - In plan mode inside the container agy used its research subagent; the
   host policy blocked subagents, the container does not.
-- In-container sign-in with `containers/signin.sh` is not yet tested (it
-  needs a terminal). `AGY_ADC_AUTH` is untested too: the host's Application
+- In-container sign-in with `containers/signin.sh` works (Abe, 24 October
+  2026, after the session expiry): the workforce sign-in completed from the
+  container, the token landed in the container home, and the container
+  smoke then passed every step at commit 47bf8ee. `AGY_ADC_AUTH` is untested: the host's Application
   Default Credentials file is an `authorized_user` credential with a refresh
   token, not a workforce federation credential, so the seat-or-pay-as-you-go
   question for ADC stays open.
