@@ -78,7 +78,7 @@ is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read, and the
 job record, the baseline snapshot and the result, which the host trusts, are
 out of the container's reach. The job's home is seeded at the start of each
 round with a copy of the container sign-in and settings from
-`~/.gemini/agy-container-home`, which itself is never mounted, so a job
+`~/.gemini/agy-container-home`, which is never mounted into a job, so a job
 cannot leave a setting, a hook or a cached package behind for the next job,
 whatever repository it was reviewing.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs

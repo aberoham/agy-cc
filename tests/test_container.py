@@ -74,7 +74,8 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     signin = Path(contained.env["AGY_CONTAINER_HOME"])
     job_mount = worktree.parent.parent / "jobs" / job["id"] / "container"
     probe, run = contained.docker_runs()
-    assert "touch" in probe and str(state) in " ".join(probe)
+    assert "touch" in probe
+    assert [o for o in probe if o.startswith("--volume=")] == [f"--volume={state}:{state}"]
     options = _run_options(run)
     volumes = [o[len("--volume=") :] for o in options if o.startswith("--volume=")]
     # Exactly these, and nothing else: the job record, the result and the
@@ -90,6 +91,7 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     seeded = job_mount / "home" / ".gemini" / "antigravity-cli"
     assert (seeded / "antigravity-oauth-token").read_text() == "{}"
     assert (seeded / "settings.json").read_text() == '{"enableTerminalSandbox": false}\n'
+    assert all(oct((seeded / n).stat().st_mode)[-3:] == "600" for n in ("antigravity-oauth-token", "settings.json"))
     env = dict(o[len("--env=") :].split("=", 1) for o in options if o.startswith("--env="))
     keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
     assert keys == {

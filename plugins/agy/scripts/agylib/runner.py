@@ -282,10 +282,21 @@ class JobRunner:
             return container.job_mount(self.dir) / "agy.log"
         return self.dir / "agy.log"
 
+    def _plan_anchor(self) -> tuple[Path, Path]:
+        """(trusted directory, brain directory relative to it) for plan artifacts.
+
+        The trusted directory is one agy cannot alter: the job's mounted
+        subdirectory for a container job, the user's home for a host job.
+        Everything below it is agy-written and is checked for links.
+        """
+        if self.job.get("isolation") == "container":
+            return container.job_mount(self.dir), Path("home") / ".gemini" / "antigravity-cli" / "brain"
+        return Path.home(), Path(".gemini") / "antigravity-cli" / "brain"
+
     def _plan_root(self) -> str:
         """Where a plan artifact may be read from: agy's brain directory for the job's home."""
-        home = container.job_home(self.dir) if self.job.get("isolation") == "container" else Path.home()
-        return str(home / ".gemini" / "antigravity-cli" / "brain") + os.sep
+        trusted, brain = self._plan_anchor()
+        return str(trusted / brain) + os.sep
 
     def _stop_container(self) -> None:
         name = self._container_name()
@@ -490,17 +501,25 @@ class JobRunner:
     def _read_plan(self, path: Path) -> str | None:
         """The plan artifact's text, or None unless the file really sits under the brain directory.
 
-        agy writes the brain directory, so a link planted there could point
-        at any file the host user can read. The real path must stay inside
-        the real brain directory (so a home behind a symlink still works),
-        and the file is opened without following a final link.
+        agy writes everything below the trusted directory, so a link planted
+        anywhere in that part of the path, the brain directory itself
+        included, could point at any file the host user can read. The path
+        must lie under the brain directory, no component below the trusted
+        directory may be a link (the trusted part may: a home behind a
+        symlink still works), and the file is opened without following a
+        final link.
         """
-        root = os.path.realpath(self._plan_root())
-        real = os.path.realpath(path)
-        if not real.startswith(root + os.sep):
+        trusted, brain = self._plan_anchor()
+        wanted = os.path.normpath(str(path))
+        root = os.path.normpath(str(trusted / brain))
+        if not wanted.startswith(root + os.sep):
             return None
+        relative = os.path.relpath(wanted, os.path.normpath(str(trusted)))
+        expected = os.path.join(os.path.realpath(str(trusted)), relative)
+        if os.path.realpath(wanted) != expected:
+            return None  # a link somewhere below the trusted directory
         try:
-            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+            fd = os.open(wanted, os.O_RDONLY | os.O_NOFOLLOW)
         except OSError:
             return None
         with os.fdopen(fd, "rb") as handle:

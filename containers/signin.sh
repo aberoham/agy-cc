@@ -21,7 +21,7 @@ home="$(/usr/bin/python3 - "${here}" <<'EOF'
 import sys
 sys.path.insert(0, sys.argv[1] + "/plugins/agy/scripts")
 from agylib import container
-print(container.agy_home())
+print(container.signin_home())
 EOF
 )"
 settings_dir="${home}/.gemini/antigravity-cli"
