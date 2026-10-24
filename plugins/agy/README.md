@@ -76,11 +76,15 @@ the job's state directory (agy's log, the exported patch and the job's own
 home) and the plugin's own files (read-only). Nothing else from your machine
 is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read, and the
 job record, the baseline snapshot and the result, which the host trusts, are
-out of the container's reach. The job's home is seeded at the start of each
-round with a copy of the container sign-in and settings from
-`~/.gemini/agy-container-home`, which is never mounted into a job, so a job
-cannot leave a setting, a hook or a cached package behind for the next job,
-whatever repository it was reviewing.
+out of the container's reach. The job's home belongs to that job alone: it
+starts empty, receives a copy of the container sign-in and settings from
+`~/.gemini/agy-container-home` (which is never mounted into a job) at the
+start of every round, and keeps agy's conversation between rounds so a
+resume works. A job therefore cannot leave a setting, a hook or a cached
+package behind for the next job, whatever repository it was reviewing. The
+patch export runs with an empty home, python in isolated mode and no user
+git configuration, so nothing a round planted in the job's home runs there.
+A `--read-dir` that overlaps the sign-in or the state directory is refused.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs
 the commands it needs, including your tests, and edits what it likes, and
 all of that lands in the working copy. For a review, a plan or a task round

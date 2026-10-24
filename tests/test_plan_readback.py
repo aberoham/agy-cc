@@ -58,3 +58,20 @@ def test_a_home_behind_a_link_still_works(tmp_path, monkeypatch):
     assert (
         runner._read_plan(tmp_path / "home" / ".gemini" / "antigravity-cli" / "brain" / "abc" / "plan.md") == "# Plan\n"
     )
+
+
+def test_a_named_pipe_in_place_of_the_plan_does_not_hang(tmp_path, monkeypatch):
+    runner = _runner(tmp_path, monkeypatch)
+    brain = tmp_path / "home" / ".gemini" / "antigravity-cli" / "brain" / "abc"
+    brain.mkdir(parents=True)
+    os.mkfifo(brain / "plan.md")
+    assert runner._read_plan(brain / "plan.md") is None
+
+
+def test_a_named_pipe_in_place_of_the_log_does_not_hang(tmp_path):
+    from agylib.runner import _read_log_chunk
+
+    os.mkfifo(tmp_path / "agy.log")
+    assert _read_log_chunk(tmp_path / "agy.log", 0) == ("", 0)
+    (tmp_path / "real.log").write_text("one\ntwo\n")
+    assert _read_log_chunk(tmp_path / "real.log", 4) == ("two\n", 8)

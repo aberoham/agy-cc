@@ -99,29 +99,80 @@ def job_home(job_dir: Path) -> Path:
 
 
 def seed_home(job_dir: Path) -> Path:
-    """Give the job a fresh home holding only the sign-in and settings, and return it.
+    """Give the job its own home with the sign-in and settings, and return it.
 
-    Anything an earlier round left there (agy's brain, caches, edited
-    settings) is removed first, so each round starts from what the user
-    signed in with. The refresh token in the copy keeps working: refreshing
-    does not rotate it, so copies refreshed independently stay valid until
-    the pool session ends.
+    The home belongs to one job: a new job starts empty, so nothing a job on
+    another repository did can reach it. Within a job the home persists
+    between rounds, because agy keeps the conversation it resumes with
+    (conversations/<id>.db) and its plan artifacts there; only the sign-in
+    and settings are written afresh each round, so a new sign-in or a
+    setting agy changed does not carry over. The refresh token in the copy
+    keeps working: refreshing does not rotate it, so copies refreshed
+    independently stay valid until the pool session ends.
     """
     home = job_home(job_dir)
-    if home.exists():
-        shutil.rmtree(home)
+    if home.is_symlink():
+        raise RuntimeError(f"the job's home {home} is a link; refusing to use it")
     target = home / ".gemini" / "antigravity-cli"
-    target.mkdir(parents=True)
+    target.mkdir(parents=True, exist_ok=True)
     source = signin_home() / ".gemini" / "antigravity-cli"
     for name in SIGNIN_FILES:
         if (source / name).is_file():
-            shutil.copyfile(source / name, target / name)
-            os.chmod(target / name, 0o600)
-    if not (target / "settings.json").is_file():
-        fd = os.open(target / "settings.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(DEFAULT_SETTINGS)
+            _write_private(target / name, (source / name).read_bytes())
+    if not (source / "settings.json").is_file():
+        _write_private(target / "settings.json", DEFAULT_SETTINGS.encode())
     return home
+
+
+def _write_private(path: Path, data: bytes) -> None:
+    """Create or replace a file with mode 0600 from the start, never through a link."""
+    if path.is_symlink():
+        path.unlink()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data)
+    os.chmod(path, 0o600)
+
+
+def export_home(job_dir: Path) -> Path:
+    """An empty home for the export container, created afresh each time.
+
+    The export runs python and git with the working copy writable, so it
+    must not pick up start-up files a round planted in the job's home
+    (a sitecustomize module, a user git configuration).
+    """
+    home = job_mount(job_dir) / "export-home"
+    if home.is_symlink() or home.is_file():
+        home.unlink()
+    elif home.is_dir():
+        remove_tree(home)
+    home.mkdir(parents=True)
+    return home
+
+
+def remove_tree(path: Path) -> None:
+    """rmtree that first makes directories a round left read-only writable again."""
+
+    def retry(func, target, _exc):
+        parent = os.path.dirname(target)
+        for candidate in (target, parent):
+            try:
+                os.chmod(candidate, 0o700)
+            except OSError:
+                pass
+        func(target)
+
+    shutil.rmtree(path, onerror=retry)
+
+
+def overlaps_protected(directory: Path) -> str | None:
+    """Why a --read-dir may not be mounted: it would expose the sign-in or other jobs' state."""
+    wanted = os.path.realpath(directory)
+    for label, protected in (("the container sign-in", signin_home()), ("the plugin's state directory", state_root())):
+        real = os.path.realpath(protected)
+        if wanted == real or real.startswith(wanted + os.sep) or wanted.startswith(real + os.sep):
+            return f"{directory} overlaps {label} ({protected})"
+    return None
 
 
 def _docker(*args: str, timeout: float = DOCKER_TIMEOUT) -> subprocess.CompletedProcess | None:
@@ -307,15 +358,23 @@ def wrap(agy_args: list[str], *, name: str, mounts: Mounts) -> list[str]:
     return command + [image_name(), *agy_args[1:], *agybin.SKIP_PERMISSIONS_FLAGS]
 
 
-def export_command(baseline: str, *, name: str, mounts: Mounts) -> list[str]:
+def export_command(baseline: str, *, name: str, mounts: Mounts, home: Path) -> list[str]:
     """A docker command that computes the job's patch inside the container,
-    into the job's mounted subdirectory."""
+    into the job's mounted subdirectory.
+
+    It runs with an empty home, python in isolated mode and no user or
+    system git configuration, so nothing a round left behind runs here.
+    """
     companion = mounts.plugin_root / "scripts" / "agy_companion.py"
+    prefix = [f"--env=HOME={home}" if o.startswith("--env=HOME=") else o for o in mounts.prefix(name)]
     return [
-        *mounts.prefix(name),
+        *prefix,
+        "--env=GIT_CONFIG_GLOBAL=/dev/null",
+        "--env=GIT_CONFIG_NOSYSTEM=1",
         "--entrypoint",
         "python3",
         image_name(),
+        "-I",
         str(companion),
         "_export",
         str(mounts.worktree),

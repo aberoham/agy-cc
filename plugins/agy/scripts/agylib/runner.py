@@ -13,6 +13,7 @@ import os
 import queue
 import re
 import signal
+import stat
 import subprocess
 import threading
 import time
@@ -170,11 +171,8 @@ def _follow(
             limit = tool_stall_seconds if active_tools else stall_seconds
             if now - last_event > limit:
                 return TurnOutcome("stall", f"no agy event for {int(limit)} s", result)
-            if log_path.exists():
-                with open(log_path, "rb") as log:
-                    log.seek(log_offset)
-                    chunk = log.read().decode("utf-8", errors="replace")
-                    log_offset = log.tell()
+            chunk, log_offset = _read_log_chunk(log_path, log_offset)
+            if chunk:
                 match = agybin.STALL_LOG_PATTERN.search(chunk)
                 if match and result is None:
                     return TurnOutcome("stall", f"agy log: {match.group(0)}", result)
@@ -190,6 +188,33 @@ def _follow(
     if result is not None:
         return TurnOutcome("result", str(result.get("status", "")), result)
     return TurnOutcome("exited", f"agy exited with code {proc.returncode} and no result", None)
+
+
+def _open_regular(path: str | Path) -> int | None:
+    """Open a regular file for reading without following a final link or blocking on a special file.
+
+    agy writes the log and the plan artifact, so either could be replaced
+    by a link or a named pipe; a pipe would hang the worker in open(2).
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        return None
+    return fd
+
+
+def _read_log_chunk(log_path: Path, offset: int) -> tuple[str, int]:
+    """New text in agy's log since offset, and the new offset."""
+    fd = _open_regular(log_path)
+    if fd is None:
+        return "", offset
+    with os.fdopen(fd, "rb") as log:
+        log.seek(offset)
+        chunk = log.read().decode("utf-8", errors="replace")
+        return chunk, log.tell()
 
 
 class JobRunner:
@@ -511,16 +536,19 @@ class JobRunner:
         """
         trusted, brain = self._plan_anchor()
         wanted = os.path.normpath(str(path))
-        root = os.path.normpath(str(trusted / brain))
-        if not wanted.startswith(root + os.sep):
+        real_trusted = os.path.realpath(str(trusted))
+        # agy may report the path through the trusted directory's real name.
+        for base in {os.path.normpath(str(trusted)), real_trusted}:
+            root = os.path.join(base, str(brain))
+            if wanted.startswith(root + os.sep):
+                relative = os.path.relpath(wanted, base)
+                break
+        else:
             return None
-        relative = os.path.relpath(wanted, os.path.normpath(str(trusted)))
-        expected = os.path.join(os.path.realpath(str(trusted)), relative)
-        if os.path.realpath(wanted) != expected:
+        if os.path.realpath(wanted) != os.path.join(real_trusted, relative):
             return None  # a link somewhere below the trusted directory
-        try:
-            fd = os.open(wanted, os.O_RDONLY | os.O_NOFOLLOW)
-        except OSError:
+        fd = _open_regular(wanted)
+        if fd is None:
             return None
         with os.fdopen(fd, "rb") as handle:
             return handle.read().decode("utf-8", errors="replace")
@@ -539,7 +567,9 @@ class JobRunner:
         name = f"{self._container_name()}-export"
         # The export stages agy's edits in the copy's own index, so it needs
         # the copy writable even after a read-only round.
-        command = container.export_command(self.job["baseline"], name=name, mounts=self._mounts(writable=True))
+        command = container.export_command(
+            self.job["baseline"], name=name, mounts=self._mounts(writable=True), home=container.export_home(self.dir)
+        )
         self.store.update(self.job_id, lambda r: r.update({"container": name}))
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=600)

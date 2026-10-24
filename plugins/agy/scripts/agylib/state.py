@@ -204,4 +204,12 @@ class JobStore:
             worktree = record.get("worktree")
             if worktree and Path(worktree).exists():
                 gitctx.remove_worktree(record.get("repo_root") or self.root, Path(worktree))
+            # A container round may leave read-only directories (a module
+            # cache, say) in the job's home; make them removable first.
+            for root_dir, dirs, _files in os.walk(self.job_dir(record["id"])):
+                for name in dirs:
+                    try:
+                        os.chmod(os.path.join(root_dir, name), 0o700, follow_symlinks=False)
+                    except (OSError, NotImplementedError):
+                        pass
             shutil.rmtree(self.job_dir(record["id"]), ignore_errors=True)

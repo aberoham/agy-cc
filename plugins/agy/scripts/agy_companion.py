@@ -183,6 +183,10 @@ def start_job(
         "generation": 1,
     }
     if isolation == "container":
+        for directory in record["read_dirs"]:
+            problem = container.overlaps_protected(Path(directory))
+            if problem:
+                raise UsageError(f"--read-dir refused: {problem}.")
         record["baseline"] = gitctx.create_copy(root, worktree)
     else:
         record["baseline"] = gitctx.create_worktree(root, worktree, hook_command(job_dir))
