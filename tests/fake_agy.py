@@ -59,7 +59,10 @@ def run_hook(cwd: Path, conversation: str, brain: Path, name: str, args: dict) -
                 out = subprocess.run(
                     hook["command"], shell=True, input=json.dumps(payload), capture_output=True, text=True
                 )
-                decision = json.loads(out.stdout)
+                try:
+                    decision = json.loads(out.stdout)
+                except ValueError:
+                    continue  # a hook that prints no decision does not object
                 if decision.get("decision") == "deny":
                     return decision
     return {"decision": "allow"}
@@ -131,8 +134,8 @@ def main() -> int:
     if calls:
         with open(calls, "a") as handle:
             handle.write(json.dumps({"argv": argv, "stdin": stdin}) + "\n")
-    if "--dangerously-skip-permissions" in argv:
-        sys.stderr.write("fake agy: the plugin must never pass --dangerously-skip-permissions\n")
+    if "--dangerously-skip-permissions" in argv and not os.environ.get("FAKE_AGY_IN_CONTAINER"):
+        sys.stderr.write("fake agy: the plugin must never pass --dangerously-skip-permissions outside a container\n")
         return 3
     message = json.loads(stdin.splitlines()[0])["message"]["content"]
     scenario = os.environ.get("FAKE_AGY_SCENARIO", "reply")
@@ -276,6 +279,35 @@ def main() -> int:
         decision = run_hook(cwd, conversation, brain, "run_command", {"CommandLine": "make test", "Cwd": str(cwd)})
         tool_step(conversation, 3, "run_command", {"CommandLine": "make test"}, decision)
         result(conversation, "Fixed stats.py. I still need `make test`.")
+        return 0
+
+    if scenario == "container":
+        # A task inside a container: edits stats.py, runs the repository's own
+        # hooks through run_command, and follows probe instructions in the
+        # request so a test can see what the container can reach.
+        if "--conversation" in argv:
+            try:
+                (cwd / "stats.py").write_text("resumed\n")
+                result(conversation, "Continued and wrote stats.py.")
+            except OSError as exc:
+                result(conversation, f"Continued; could not write stats.py: {exc.strerror}")
+            return 0
+        notes = []
+        for line in message.splitlines():
+            words = line.split()
+            if words[:1] == ["probe-read"]:
+                notes.append(f"read {words[1]}: {'exists' if Path(words[1]).exists() else 'missing'}")
+            if words[:1] == ["probe-stall"]:
+                time.sleep(3600)
+            if words[:1] == ["probe-filter"]:
+                (cwd / ".gitattributes").write_text("*.py filter=x\n")
+                subprocess.run(["git", "config", "filter.x.clean", f"touch {words[1]}"], cwd=cwd, check=True)
+                notes.append(f"filter set to touch {words[1]}")
+        (cwd / "stats.py").write_text("fixed\n")
+        tool_step(conversation, 1, "write_file", {"Path": str(cwd / "stats.py")}, {"decision": "allow"})
+        decision = run_hook(cwd, conversation, brain, "run_command", {"CommandLine": "make test", "Cwd": str(cwd)})
+        tool_step(conversation, 2, "run_command", {"CommandLine": "make test"}, decision)
+        result(conversation, "Fixed stats.py and ran make test.\n" + "\n".join(notes))
         return 0
 
     if scenario == "permission-denied":

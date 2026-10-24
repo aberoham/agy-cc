@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from . import agybin, gitctx, sandbox
+from . import agybin, container, gitctx, sandbox
 from .policy import WRITE_TOOLS
 from .state import JobStore, now_iso, read_json, write_json
 
@@ -88,7 +88,10 @@ def run_turn(
     env: dict[str, str] | None = None,
     tool_stall_seconds: float = DEFAULT_TOOL_STALL_SECONDS,
     on_start: Callable[[int], None] | None = None,
+    on_stop: Callable[[], None] | None = None,
 ) -> TurnOutcome:
+    """Run one agy turn and follow it. on_stop runs after agy's process group
+    is stopped, for whatever the process group does not cover (a container)."""
     log_offset = log_path.stat().st_size if log_path.exists() else 0
     with open(stderr_path, "ab") as stderr:
         proc = subprocess.Popen(
@@ -108,6 +111,8 @@ def run_turn(
         )
     finally:
         _stop(proc)
+        if on_stop:
+            on_stop()
 
 
 def _follow(
@@ -238,8 +243,10 @@ class JobRunner:
             if step.get("state") == "DONE":
                 self.progress["tools"] += 1
                 path = params.get("Path") or params.get("TargetFile")
-                if name in WRITE_TOOLS and isinstance(path, str) and "/brain/" in path and path.endswith(".md"):
-                    self.plan_paths.append(path)
+                if name in WRITE_TOOLS and isinstance(path, str) and path.endswith(".md"):
+                    # Only a file under the brain directory is read back on the host.
+                    if os.path.normpath(path).startswith(self._plan_root()):
+                        self.plan_paths.append(path)
             if step.get("state") == "ERROR":
                 message = str((info.get("error") or {}).get("message", ""))
                 match = PERMISSION_DENIED.search(message)
@@ -252,7 +259,38 @@ class JobRunner:
     # Turn loop --------------------------------------------------------------
 
     def _record_agy_pid(self, pid: int) -> None:
-        self.store.update(self.job_id, lambda r: r.update({"agy_pid": pid}))
+        self.store.update(self.job_id, lambda r: r.update({"agy_pid": pid, "container": self._container_name()}))
+
+    def _container_name(self) -> str | None:
+        if self.job.get("isolation") != "container":
+            return None
+        return container.container_name(self.job_id, int(self.job.get("generation") or 1))
+
+    def _mounts(self, writable: bool) -> container.Mounts:
+        return container.Mounts(
+            Path(self.job["worktree"]),
+            self.dir,
+            Path(self.job["plugin_root"]),
+            [Path(p) for p in self.job.get("read_dirs") or []],
+            writable=writable,
+        )
+
+    @property
+    def log_path(self) -> Path:
+        """agy's log. A container job writes it into the one job subdirectory the container may see."""
+        if self.job.get("isolation") == "container":
+            return container.job_mount(self.dir) / "agy.log"
+        return self.dir / "agy.log"
+
+    def _plan_root(self) -> str:
+        """Where a plan artifact may be read from: agy's brain directory for the job's home."""
+        home = container.agy_home() if self.job.get("isolation") == "container" else Path.home()
+        return str(home / ".gemini" / "antigravity-cli" / "brain") + os.sep
+
+    def _stop_container(self) -> None:
+        name = self._container_name()
+        if name:
+            container.remove(name)
 
     def _command(self, model: str, conversation: str | None) -> list[str]:
         binary = Path(self.job["agy_bin"])
@@ -261,10 +299,14 @@ class JobRunner:
             binary,
             model=model,
             mode=self.job["mode"],
-            log_file=self.dir / "agy.log",
+            log_file=self.log_path,
             conversation_id=conversation,
             json_schema=Path(schema) if schema else None,
         )
+        name = self._container_name()
+        if name:
+            writable = bool(self.job.get("writable")) and not self.job.get("read_only_round")
+            return container.wrap(command, name=name, mounts=self._mounts(writable))
         if self.job.get("os_sandbox"):
             command = sandbox.wrap(
                 command,
@@ -301,7 +343,7 @@ class JobRunner:
                 cwd=Path(self.job["worktree"]),
                 message=message,
                 events_path=self.dir / "events.ndjson",
-                log_path=self.dir / "agy.log",
+                log_path=self.log_path,
                 stderr_path=self.dir / "agy.stderr.txt",
                 stall_seconds=stall_seconds,
                 deadline=deadline,
@@ -309,6 +351,7 @@ class JobRunner:
                 env=env,
                 tool_stall_seconds=float(self.job.get("tool_stall_seconds", DEFAULT_TOOL_STALL_SECONDS)),
                 on_start=self._record_agy_pid,
+                on_stop=self._stop_container,
             )
             # A finished turn reports its total; an interrupted one only its steps.
             turn_usage = (outcome.result or {}).get("usage") or self.step_usage
@@ -370,7 +413,10 @@ class JobRunner:
             error = outcome.detail
             stderr_tail = _tail(self.dir / "agy.stderr.txt")
             if any(hint in stderr_tail.lower() for hint in AUTH_HINTS):
-                error = "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
+                if self.job.get("isolation") == "container":
+                    error = "agy is not signed in for containers. Run containers/signin.sh in a terminal."
+                else:
+                    error = "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
             stored["stderr_tail"] = stderr_tail
         elif result.get("status") != "SUCCESS":
             error = result.get("error") or f"agy finished with status {result.get('status')}"
@@ -383,19 +429,20 @@ class JobRunner:
             stored["review"], stored["parse_error"] = _parse_review(result, schema)
         if kind == "plan" and self.plan_paths:
             plan_file = Path(self.plan_paths[-1])
-            if plan_file.is_file():
+            plan_text = self._read_plan(plan_file)
+            if plan_text is not None:
                 stored["plan_path"] = str(plan_file)
-                stored["plan_markdown"] = plan_file.read_text(encoding="utf-8", errors="replace")
+                stored["plan_markdown"] = plan_text
         if self.job.get("writable"):
             patch_file = self.dir / "changes.patch"
             if patch_file.exists():
                 patch_file.unlink()  # never leave an earlier round's patch for apply
             try:
-                changes = gitctx.export_changes(Path(self.job["worktree"]), self.job["baseline"])
+                changes = self._export_changes()
                 patch_file.write_bytes(changes["patch"])
                 stored["changed_files"] = changes["name_status"]
                 stored["changed_paths"] = changes["paths"]
-            except gitctx.GitError as exc:
+            except (gitctx.GitError, RuntimeError) as exc:
                 error = error or f"could not export agy's changes: {exc}"
 
         write_json(self.dir / "result.json", stored)
@@ -420,6 +467,7 @@ class JobRunner:
                     "error": error,
                     "pid": None,
                     "agy_pid": None,
+                    "container": None,
                     "model": round_record["final_model"],
                     "completed_at": now_iso(),
                     "queued_commands": commands,
@@ -436,6 +484,53 @@ class JobRunner:
         if self.job.get("kind") != "task" and record.get("status") in ("completed", "failed", "cancelled"):
             gitctx.remove_worktree(self.job["repo_root"], Path(self.job["worktree"]))
         return record
+
+    def _read_plan(self, path: Path) -> str | None:
+        """The plan artifact's text, or None unless the file really sits under the brain directory.
+
+        agy writes the brain directory, so a link planted there could point
+        at any file the host user can read. The real path must stay inside
+        the real brain directory (so a home behind a symlink still works),
+        and the file is opened without following a final link.
+        """
+        root = os.path.realpath(self._plan_root())
+        real = os.path.realpath(path)
+        if not real.startswith(root + os.sep):
+            return None
+        try:
+            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read().decode("utf-8", errors="replace")
+
+    def _export_changes(self) -> dict[str, Any]:
+        """agy's changes as a patch. A container job computes it inside the
+        container, so the host runs no git over files agy has written."""
+        worktree = Path(self.job["worktree"])
+        if self.job.get("isolation") != "container":
+            return gitctx.export_changes(worktree, self.job["baseline"])
+        mount = container.job_mount(self.dir)
+        for stale in ("changes.patch", "changes.json"):
+            (mount / stale).unlink(missing_ok=True)
+        # The export container is recorded on the job like the turn's, so a
+        # cancel or a session end removes it too; the finally covers a timeout.
+        name = f"{self._container_name()}-export"
+        # The export stages agy's edits in the copy's own index, so it needs
+        # the copy writable even after a read-only round.
+        command = container.export_command(self.job["baseline"], name=name, mounts=self._mounts(writable=True))
+        self.store.update(self.job_id, lambda r: r.update({"container": name}))
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        finally:
+            container.remove(name)
+        if proc.returncode != 0:
+            raise RuntimeError(f"the export container failed: {proc.stderr.strip()[-500:]}")
+        summary = read_json(mount / "changes.json")
+        patch_file = mount / "changes.patch"
+        if not isinstance(summary, dict) or not patch_file.is_file():
+            raise RuntimeError("the export container wrote no result")
+        return {"patch": patch_file.read_bytes(), "name_status": summary["name_status"], "paths": summary["paths"]}
 
 
 def _parse_review(result: dict[str, Any], schema: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -542,6 +637,7 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
     """Stop the workers and agy process groups of several jobs at once,
     escalating to SIGKILL after one shared grace period."""
     groups = set()
+    containers = [str(job["container"]) for job in jobs if job.get("container")]
     for job in jobs:
         for key in ("pid", "agy_pid"):
             pid = job.get(key)
@@ -559,18 +655,25 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
             # stop the user's own programs.
             if group == int(pid) and str(job.get("id", "")) in _command_line(int(pid)):
                 groups.add(group)
-    if not groups:
-        return False
     for group in groups:
         _signal_group(group, signal.SIGTERM)
+    # Containers after the signals, all at once and under the same deadline,
+    # so a slow Docker daemon neither delays the signals nor stretches a
+    # session-end hook past its budget.
     deadline = time.monotonic() + grace
+    removals = [
+        threading.Thread(target=container.remove, args=(name,), kwargs={"timeout": grace}, daemon=True)
+        for name in containers
+    ]
+    for thread in removals:
+        thread.start()
     while time.monotonic() < deadline:
-        if not any(_signal_group(group, 0) for group in groups):
-            return True
+        if not any(_signal_group(group, 0) for group in groups) and not any(t.is_alive() for t in removals):
+            return bool(groups or containers)
         time.sleep(0.2)
     for group in groups:
         _signal_group(group, signal.SIGKILL)
-    return True
+    return bool(groups or containers)
 
 
 __all__ = ["JobRunner", "run_turn", "terminate_job_processes", "read_json"]

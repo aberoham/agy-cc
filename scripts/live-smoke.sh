@@ -11,7 +11,8 @@
 #   scripts/live-smoke.sh --apply                 # run it (model: gemini-4-argon-low)
 #   scripts/live-smoke.sh --apply --with-claude   # also drive two commands through claude --plugin-dir
 #
-# Environment: AGY_SMOKE_MODEL (default low), AGY_BIN (agy binary), CLAUDE_BIN.
+# Environment: AGY_SMOKE_MODEL (default low), AGY_SMOKE_ISOLATION (container,
+# host, or auto, the default), AGY_BIN (agy binary), CLAUDE_BIN.
 set -euo pipefail
 
 apply=false
@@ -43,6 +44,7 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 plugin="${here}/plugins/agy"
 companion_py="${plugin}/scripts/agy_companion.py"
 model="${AGY_SMOKE_MODEL:-low}"
+isolation="${AGY_SMOKE_ISOLATION:-auto}"
 python="${PYTHON:-python3}"
 
 steps=(
@@ -58,7 +60,7 @@ steps=(
     "cancel: a background job stops and leaves no agy process"
 )
 if ! ${apply}; then
-    echo "Dry run. With --apply this runs, on model ${model}:"
+    echo "Dry run. With --apply this runs, on model ${model} with isolation ${isolation}:"
     printf '  - %s\n' "${steps[@]}"
     if ${with_claude}; then
         echo "  - claude --plugin-dir: /agy:setup and /agy:review --wait"
@@ -67,7 +69,10 @@ if ! ${apply}; then
     exit 0
 fi
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/agy-smoke.XXXXXX")"
+# Under the home directory, because a Docker virtual machine on macOS shares
+# that and not the system temporary directory.
+mkdir -p "${HOME}/.cache/agy-smoke"
+work="$(mktemp -d "${HOME}/.cache/agy-smoke/run.XXXXXX")"
 work="$(cd "${work}" && pwd -P)"
 export AGY_COMPANION_STATE_DIR="${work}/state"
 repo="${work}/repo"
@@ -84,6 +89,8 @@ fail() {
     failures=$((failures + 1))
 }
 companion() { (cd "${repo}" && "${python}" "${companion_py}" "$@"); }
+# Job-starting commands take the isolation; status, result, apply and cancel do not.
+start_job() { companion "$1" --isolation "${isolation}" "${@:2}"; }
 newest_job() {
     "${python}" - "${AGY_COMPANION_STATE_DIR}" "$1" <<'PY' || echo "{}"
 import json, sys
@@ -127,7 +134,7 @@ checkout_state() {
     sgit diff --no-ext-diff --no-textconv
 }
 
-log "agy plugin live smoke test, $(date -u +%Y-%m-%dT%H:%M:%SZ), model ${model}"
+log "agy plugin live smoke test, $(date -u +%Y-%m-%dT%H:%M:%SZ), model ${model}, isolation ${isolation}"
 log "Work directory: ${work}"
 if ! prepare; then
     fail prepare "could not create the throwaway repository in ${repo}"
@@ -140,7 +147,7 @@ start=${SECONDS}
 out=""
 if out="$(companion setup --json)" && [[ "$(field "${out}" ready)" == "True" ]]; then
     pass setup $((SECONDS - start))
-    log "      agy $(field "${out}" agy_version) at $(field "${out}" agy_path)"
+    log "      agy $(field "${out}" agy_version) at $(field "${out}" agy_path); default isolation $(field "${out}" isolation)"
 else
     fail setup "not ready: ${out:-no output}"
     log "Stopping: agy must be ready for the other steps."
@@ -150,7 +157,7 @@ fi
 # review
 start=${SECONDS}
 rc=0
-out="$(companion review --model "${model}" --wait-seconds 280)" || rc=$?
+out="$(start_job review --model "${model}" --wait-seconds 280)" || rc=$?
 job="$(newest_job review)"
 lower="$(printf '%s' "${out}" | tr '[:upper:]' '[:lower:]')"
 if ((rc == 0)) && [[ "${out}" == *"Verdict: needs-attention"* ]] \
@@ -165,7 +172,7 @@ fi
 # adversarial review
 start=${SECONDS}
 rc=0
-out="$(companion adversarial-review --model "${model}" --wait-seconds 280 empty input)" || rc=$?
+out="$(start_job adversarial-review --model "${model}" --wait-seconds 280 empty input)" || rc=$?
 if ((rc == 0)) && [[ "${out}" == *"Verdict:"* ]] && [[ "$(checkout_state)" == "${before}" ]]; then
     pass adversarial-review $((SECONDS - start))
 else
@@ -175,7 +182,7 @@ fi
 # plan
 start=${SECONDS}
 rc=0
-out="$(companion plan --model "${model}" --wait-seconds 280 add a median function to stats.py)" || rc=$?
+out="$(start_job plan --model "${model}" --wait-seconds 280 add a median function to stats.py)" || rc=$?
 job="$(newest_job plan)"
 plan_status="$(field "${job}" status)"
 if ((rc == 0)) && [[ "${plan_status}" == "completed" || "${plan_status}" == "needs-approval" ]] \
@@ -190,7 +197,7 @@ fi
 # task
 start=${SECONDS}
 rc=0
-out="$(companion task --model "${model}" --wait-seconds 280 "Fix the off-by-one bug in average() in stats.py. Then run exactly: ${expected}")" || rc=$?
+out="$(start_job task --model "${model}" --wait-seconds 280 "Fix the off-by-one bug in average() in stats.py. Then run exactly: ${expected}")" || rc=$?
 job="$(newest_job task)"
 task_id="$(field "${job}" id)"
 status="$(field "${job}" status)"
@@ -217,7 +224,7 @@ if [[ "${status}" == "needs-approval" ]]; then
             fail resume "could not write ${results}"
         else
             rc=0
-            out="$(companion resume "${task_id}" "${results}" --wait-seconds 280)" || rc=$?
+            out="$(start_job resume "${task_id}" "${results}" --wait-seconds 280)" || rc=$?
             status="$(field "$(newest_job task)" status)"
             if ((crc == 0)) && ((rc == 0)) && [[ "${status}" == "completed" ]]; then
                 pass resume $((SECONDS - start))
@@ -266,7 +273,7 @@ fi
 
 # cancel
 start=${SECONDS}
-if ! companion plan --background --model "${model}" design a plugin system for stats.py >/dev/null; then
+if ! start_job plan --background --model "${model}" design a plugin system for stats.py >/dev/null; then
     fail cancel "could not start a background job"
 else
     job="{}"
@@ -280,8 +287,12 @@ else
     companion cancel "$(field "${job}" id)" >/dev/null || rc=$?
     sleep 2
     job="$(newest_job plan)"
+    leftover=""
+    if [[ -n "$(field "${job}" isolation)" && "$(field "${job}" isolation)" == "container" ]]; then
+        leftover="$(docker ps --all --quiet --filter "name=agy-$(field "${job}" id)" 2>/dev/null || true)"
+    fi
     if ((rc == 0)) && [[ "$(field "${job}" status)" == "cancelled" ]] && [[ -n "${agy_pid}" ]] \
-        && ! kill -0 "${agy_pid}" 2>/dev/null; then
+        && ! kill -0 "${agy_pid}" 2>/dev/null && [[ -z "${leftover}" ]]; then
         pass cancel $((SECONDS - start))
     else
         fail cancel "exit ${rc}, status $(field "${job}" status), agy pid ${agy_pid:-none}"

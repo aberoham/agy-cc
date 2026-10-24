@@ -13,6 +13,7 @@ import os
 import shutil
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -20,16 +21,17 @@ MAX_UNTRACKED_BYTES = 256 * 1024
 MAX_INLINE_DIFF_BYTES = 400 * 1024
 AGENTS_DIR = ".agents"
 HOOKS_PATH = os.path.join(AGENTS_DIR, "hooks.json")
-# Never exported: the .agents directory, which install_hooks reserves for the
-# plugin's own hook (matched case-insensitively, as a case-insensitive
-# filesystem would), and files that commands run in the working copy leave
-# behind.
-EXPORT_EXCLUDES = (
-    f":(exclude,icase,glob){AGENTS_DIR}/**",
+# Never exported: files that commands run in the working copy leave behind,
+# and in host mode the .agents directory, which install_hooks reserves for
+# the plugin's own hook (matched case-insensitively, as a case-insensitive
+# filesystem would). A container job keeps the repository's own .agents
+# files, so its edits there are exported like any other.
+CONTAINER_EXPORT_EXCLUDES = (
     ":(exclude,glob)**/__pycache__/**",
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/.pytest_cache/**",
 )
+EXPORT_EXCLUDES = (f":(exclude,icase,glob){AGENTS_DIR}/**", *CONTAINER_EXPORT_EXCLUDES)
 BASELINE_IDENTITY = ["-c", "user.name=agy plugin", "-c", "user.email=agy-plugin@localhost"]
 
 
@@ -75,12 +77,19 @@ SAFE_GIT = [
 PATCH_FORMAT = ["--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3"]
 
 
-def git(cwd: str | Path, *args: str, check: bool = True, input_bytes: bytes | None = None) -> str:
+def git(
+    cwd: str | Path,
+    *args: str,
+    check: bool = True,
+    input_bytes: bytes | None = None,
+    env: dict[str, str] | None = None,
+) -> str:
     proc = subprocess.run(
         [*SAFE_GIT, *args],
         cwd=str(cwd),
         input=input_bytes,
         capture_output=True,
+        env=env,
     )
     if check and proc.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {proc.stderr.decode(errors='replace').strip()}")
@@ -224,21 +233,76 @@ def create_worktree(cwd: str | Path, dest: Path, hook_command: str | None = None
         if hook_command is not None:
             install_hooks(dest, hook_command)
         git(dest, "add", "-A")
-        git(
-            dest,
-            *BASELINE_IDENTITY,
-            "commit",
-            "--quiet",
-            "--no-verify",
-            "--allow-empty",
-            "--cleanup=verbatim",  # commit.cleanup with an odd core.commentChar could empty the message
-            "-m",
-            "agy job baseline",
-        )
+        _commit_baseline(dest)
         return git(dest, "rev-parse", "HEAD").strip()
     except Exception:
         remove_worktree(root, dest)
         raise
+
+
+def create_copy(cwd: str | Path, dest: Path) -> str:
+    """Make a self-contained repository holding HEAD's tree plus the user's changes; return the baseline commit.
+
+    A container job gets this instead of a linked worktree, because a
+    worktree's objects and admin directory live in the user's .git, which is
+    not mounted. The copy has its own .git, so git inside the container can
+    stage and diff agy's edits without touching the user's repository, and
+    the host never runs git in the copy once agy has written to it. The
+    repository's history is not copied; the copy starts at the baseline.
+    """
+    root = repo_root(cwd)
+    if not has_head(root):
+        raise GitError("the repository has no commits yet")
+    dest.mkdir(parents=True, exist_ok=False)
+    try:
+        _checkout_head_tree(root, dest)
+        git(dest, "-c", "init.defaultBranch=agy-job", "init", "--quiet")
+        _populate_worktree(root, dest)
+        git(dest, "add", "-A")
+        _commit_baseline(dest)
+        return git(dest, "rev-parse", "HEAD").strip()
+    except Exception:
+        shutil.rmtree(dest, ignore_errors=True)
+        raise
+
+
+def _checkout_head_tree(root: Path, dest: Path) -> None:
+    """Write HEAD's tree into dest through a temporary index, so the user's own index is untouched."""
+    with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ, GIT_INDEX_FILE=os.path.join(tmp, "index"))
+        git(root, "read-tree", "HEAD", env=env)
+        git(root, f"--work-tree={dest}", "checkout-index", "--all", "--force", env=env)
+
+
+def _commit_baseline(dest: Path) -> None:
+    git(
+        dest,
+        *BASELINE_IDENTITY,
+        "commit",
+        "--quiet",
+        "--no-verify",
+        "--allow-empty",
+        "--cleanup=verbatim",  # commit.cleanup with an odd core.commentChar could empty the message
+        "-m",
+        "agy job baseline",
+    )
+
+
+def baseline_tree(dest: Path, baseline: str) -> dict[str, list[str]]:
+    """Mode and blob id of every path in the baseline, read before agy runs.
+
+    apply compares the user's files against this snapshot instead of running
+    git in the working copy, which agy may have reconfigured by then.
+    """
+    out = git(dest, "ls-tree", "-r", "-z", baseline)
+    tree: dict[str, list[str]] = {}
+    for entry in out.split("\0"):
+        if not entry:
+            continue
+        meta, path = entry.split("\t", 1)
+        mode, _kind, blob = meta.split()
+        tree[path] = [mode, blob]
+    return tree
 
 
 def _populate_worktree(root: Path, dest: Path) -> None:
@@ -292,14 +356,16 @@ def install_hooks(dest: Path, hook_command: str) -> None:
     path.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 
 
-def export_changes(dest: Path, baseline: str) -> dict[str, Any]:
-    """Return agy's changes in the worktree: a byte-exact patch, a file list, and the paths."""
+def export_changes(dest: Path, baseline: str, excludes: tuple[str, ...] = EXPORT_EXCLUDES) -> dict[str, Any]:
+    """Return agy's changes in the working copy: a byte-exact patch, a file list, and the paths.
+
+    This runs git in a copy agy has written to, so in container mode it runs
+    inside the container (the companion's _export command), never on the host.
+    """
     git(dest, "add", "-A")
     try:
-        files = git(dest, "diff", "--cached", "--name-status", baseline, "--", ".", *EXPORT_EXCLUDES)
-        raw = git(
-            dest, "diff", "--cached", "--name-status", "-z", "--no-renames", baseline, "--", ".", *EXPORT_EXCLUDES
-        )
+        files = git(dest, "diff", "--cached", "--name-status", baseline, "--", ".", *excludes)
+        raw = git(dest, "diff", "--cached", "--name-status", "-z", "--no-renames", baseline, "--", ".", *excludes)
         patch = git_bytes(
             dest,
             "diff",
@@ -310,7 +376,7 @@ def export_changes(dest: Path, baseline: str) -> dict[str, Any]:
             baseline,
             "--",
             ".",
-            *EXPORT_EXCLUDES,
+            *excludes,
         )
     finally:
         git(dest, "reset", "--quiet")
@@ -331,8 +397,8 @@ def _user_entry(root: Path, rel: str) -> tuple[str, str] | None:
     return mode, git(root, "hash-object", "--no-filters", "--", rel, check=False).strip()
 
 
-def baseline_mismatches(root: Path, dest: Path, baseline: str, paths: list[list[str]]) -> list[str]:
-    """Paths whose content, type or mode in the user's tree no longer matches the job's baseline."""
+def baseline_mismatches(root: Path, tree: dict[str, list[str]], paths: list[list[str]]) -> list[str]:
+    """Paths whose content, type or mode in the user's tree no longer matches the job's baseline snapshot."""
     mismatched = []
     for status, rel in paths:
         actual = _user_entry(root, rel)
@@ -340,8 +406,8 @@ def baseline_mismatches(root: Path, dest: Path, baseline: str, paths: list[list[
             if actual is not None or (root / rel).exists():
                 mismatched.append(rel)
             continue
-        listed = git(dest, "ls-tree", baseline, "--", rel, check=False).split()
-        expected = (listed[0], listed[2]) if len(listed) >= 3 else None
+        listed = tree.get(rel)
+        expected = (listed[0], listed[1]) if listed else None
         if actual != expected:
             mismatched.append(rel)
     return mismatched

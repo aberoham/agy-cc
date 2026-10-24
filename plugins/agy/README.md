@@ -16,6 +16,10 @@ works on its own copy of your repository, so agy never edits your checkout.
   window. `/agy:setup` shows the project agy will use.
 - **git**, and `python3` 3.9 or later. The macOS system Python from the
   Command Line Tools is enough; the plugin needs no packages.
+- **Docker or Colima, and the agy image**, for container isolation. Build the
+  image from `containers/` in the source repository and sign in once with
+  `containers/signin.sh`. Without them the plugin falls back to host mode,
+  described below.
 
 ## Install
 
@@ -45,19 +49,66 @@ Then run `/agy:setup`.
 | `/agy:setup` | Checks that agy is installed and signed in. |
 
 Most commands accept `--model high|medium|low` (Gemini 4 Argon High, Medium or
-Low) and `--background`. The default model is Medium.
+Low), `--background` and `--isolation container|host`. The default model is
+Medium. The default isolation is the container when Docker, the image and the
+container sign-in are all present, otherwise the host; `/agy:setup` says
+which, and `/agy:status` shows it per job.
 
 ## How a job is contained
 
 agy has no enforced read-only mode: `--mode plan` only adds an instruction to
-the prompt. The plugin does not rely on it. Each job gets three layers:
+the prompt. The plugin does not rely on it. Every job starts from a separate
+working copy in the plugin's state directory, not in your repository, holding
+your `HEAD` plus your uncommitted and untracked changes. The plugin's own git
+calls turn off repository hooks, the fsmonitor helper and commit signing, so
+setting up the copy runs no program your repository configures, and they pin
+the patch format so your diff and colour settings cannot break it.
 
-1. **A separate working copy.** A detached git worktree of your `HEAD`, with
-   your uncommitted and untracked changes copied in. It lives in the plugin's
-   state directory, not in your repository. The plugin's own git calls turn
-   off repository hooks, the fsmonitor helper and commit signing, so setting
-   up the copy runs no program your repository configures, and they pin the
-   patch format so your diff and colour settings cannot break it.
+### Container mode
+
+agy runs in a Linux container (`containers/Dockerfile`) that can see four
+things, each mounted at its host path: the working copy, one subdirectory of
+the job's state directory (for agy's log and the exported patch), the
+plugin's own files (read-only) and a separate agy home
+(`~/.gemini/agy-container-home`) that holds the container sign-in. Nothing
+else from your machine is mounted, so there is no `~/.aws`, `~/.ssh` or
+keychain to read, and the job record, the baseline snapshot and the result,
+which the host trusts, are out of the container's reach.
+Inside the container agy runs with `--dangerously-skip-permissions`: it runs
+the commands it needs, including your tests, and edits what it likes, and
+all of that lands in the working copy. For a review, a plan or a task round
+with `--read-only`, the working copy is mounted read-only, so agy cannot edit
+it at all.
+
+- The working copy is a self-contained repository (your `HEAD` tree plus your
+  changes as its only commit), not a linked worktree, so nothing inside the
+  container reaches your `.git`.
+- The patch is computed inside the container too. The host runs no git over
+  files agy has written; it only runs `git apply` into your checkout, and
+  compares your files against a snapshot of the baseline taken before agy
+  started.
+- Your repository's own `.agents` hooks and workspace plugins run, inside the
+  container, as they would for a developer.
+- agy's own terminal sandbox is off inside the container (Docker blocks the
+  user namespaces it needs); the container is the boundary.
+
+What the container does not change: agy still has the network, because it
+must reach Google, so a prompt injection in the repository can send out
+anything the container can read: the repository, any `--read-dir`
+directory, and the container sign-in in the container home. The repository
+already goes to Google for the review, so that part is not new, but it is
+not nothing. The container sign-in is a credential like the one in your own
+`~/.gemini`; with workforce identity federation it expires with the pool's
+session duration (see `NOTES.md`). And a Docker virtual machine on
+macOS shares only some directories: the plugin's state directory and the
+container home must be under your home (Colima's default share), which
+`/agy:setup` checks.
+
+### Host mode
+
+Without a container, each job gets three layers:
+
+1. **A linked worktree** of your repository as the working copy.
 2. **A tool policy.** The plugin installs an agy `PreToolUse` hook in that
    working copy. The copy's `.agents` directory is emptied first and holds
    only that hook, because agy would otherwise run any hooks and workspace
@@ -85,11 +136,12 @@ the prompt. The plugin does not rely on it. Each job gets three layers:
    is itself under a temporary directory. Pass `--no-os-sandbox` to turn this
    off. On Linux there is no equivalent layer yet.
 
-The plugin never passes `--dangerously-skip-permissions`.
+In host mode the plugin never passes `--dangerously-skip-permissions`.
 
-## Commands agy wants to run
+## Commands agy wants to run (host mode)
 
-In print mode agy refuses any shell command that is not in its own
+In a container agy runs its own commands. On the host, in print mode agy
+refuses any shell command that is not in its own
 `permissions.allow` list (in `~/.gemini/antigravity-cli/settings.json`), and
 an agy hook cannot override that. The plugin's policy is stricter still. It
 lets a command through only when the program is one of `ls`, `cat`, `head`,
@@ -126,14 +178,20 @@ for the sign-in quirks we hit.
 
 `tests/` in the source repository runs the companion against a fake agy that
 copies the behaviour recorded from agy 1.4.7, including permission denials,
-hook calls, stalls and recorded streams replayed unchanged. CI runs it on
-Linux and macOS with Python 3.9 and 3.13; the macOS run exercises the real
-`sandbox-exec` profile. The tests use no Gemini licence and no Claude account.
-They show the plugin handles agy's recorded behaviour, not that a live model
-still behaves that way.
+hook calls, stalls and recorded streams replayed unchanged, and against a
+fake docker that runs containers as host processes. CI runs it on Linux and
+macOS with Python 3.9 and 3.13; the macOS run exercises the real
+`sandbox-exec` profile, and where a Docker daemon is reachable
+`test_real_container.py` runs the fake agy inside a real container and checks
+that a repository hook, a file outside the working copy and a git clean
+filter all stay inside it. The tests use no Gemini licence and no Claude
+account. They show the plugin handles agy's recorded behaviour, not that a
+live model still behaves that way.
 
 For that, run `scripts/live-smoke.sh --apply` from the source repository on a
-machine where agy is signed in. In a throwaway repository it runs the
+machine where agy is signed in (`AGY_SMOKE_ISOLATION=container` or `host`
+picks the mode; the default is whatever `/agy:setup` would choose). In a
+throwaway repository it runs the
 companion's setup, review, adversarial review, plan, task, resume, result,
 apply check and cancel against the real agy, checks each result, and prints
 the approval-round table. `/agy:rescue` itself is not run: it is a Claude
@@ -148,8 +206,9 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
   of a real file. Claude verifies agy's quotes and `file:line` claims before
   relaying them, and says which it checked.
 - **Plans go to agy's artifact directory.** In plan mode agy writes
-  `implementation_plan.md` under `~/.gemini/antigravity-cli/brain/<id>/`; its
-  reply only summarises it. `/agy:result` shows the file.
+  `implementation_plan.md` under `~/.gemini/antigravity-cli/brain/<id>/` (for
+  a container job, under the container home); its reply only summarises it.
+  `/agy:result` shows the file.
 - **Resumes cost tokens.** A resumed conversation carries its history, so
   each approval round costs more input tokens than the last.
 - **`--wait` returns after 100 seconds** with the job still running in the
@@ -176,9 +235,13 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
 
 ## Open questions
 
-- **Containers.** An experimental Linux container image is in `containers/`
-  in the source repository. Signing in inside a container stores agy's refresh
-  token in a Docker volume, which is still a long-lived secret.
+- **Container sign-in.** `containers/signin.sh` stores agy's sign-in in the
+  container home, so a container user signs in twice, once per home, and
+  again when the pool's session expires. `AGY_ADC_AUTH=true` (preview) with
+  Application Default Credentials would avoid the second sign-in; whether it
+  bills the Gemini Enterprise seat or pay-as-you-go is not verified.
+- **Host mode's future.** Once container mode has run live for a while, the
+  host-side policy, sandbox and `/agy:resume` loop are due for removal.
 - **The Antigravity Python SDK** offers real permission callbacks, but it
   bills through Gemini Enterprise Agent Platform (formerly Vertex AI) rather
   than a Gemini Enterprise seat.

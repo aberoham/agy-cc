@@ -168,6 +168,9 @@ def test_cancel_stops_worker_and_agy(companion, tmp_path):
     )
     job = companion.wait_for(lambda j: j["status"] == "running" and j.get("agy_pid"))
     worker_pid = job["pid"]
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not pid_file.exists():
+        time.sleep(0.1)  # the fake agy writes its pid after the companion records it
     agy_pid = int(pid_file.read_text().split()[0])
     companion.run("cancel")
     deadline = time.monotonic() + 15

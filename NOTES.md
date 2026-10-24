@@ -123,6 +123,67 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   plugin's data directory; the job state then lands there. Harmless, but
   `/agy:status` from a plain terminal will not see those jobs.
 
+## Container mode, verified live (24 October 2026)
+
+- Colima (virtiofs) shares the home directory and not `/var/folders`: a
+  `touch` through a bind mount of a `mktemp -d` directory failed with
+  "Permission denied", and the same under `~/.claude` worked. So the state
+  root must be under the home directory for container jobs; the companion
+  probes this with a `touch` from inside the container.
+- With `--user 501:20` the files the host created appear owned by `501 20`
+  inside the container, but git in the container still refused the working
+  copy as "dubious ownership" until `safe.directory=*` was passed through
+  `GIT_CONFIG_*` environment variables.
+- Live runs on `gemini-4-argon-low` with `--isolation container`, the image
+  from `containers/Dockerfile` and the sign-in home seeded by copying the
+  host's `antigravity-oauth-token` plus a `settings.json` with the host's
+  `gcp` block and `enableTerminalSandbox: false`: task 45 s (edited
+  `stats.py`, ran the requested `python3 -c` itself, patch exported inside
+  the container and `apply --check` passed on the host); review 19 s with
+  the planted bug found; plan 1 m 57 s with the plan read from the brain
+  directory in the container home. No container was left after any run.
+- The task was asked to list `~/.aws`, `~/.ssh` and the host's `~/.gemini`;
+  the model declined on policy grounds and the Gemini API also returned a
+  content-safety error for that turn, so the job ended `failed` while its
+  patch was still exported. So no live run has shown those paths absent. The
+  fake-agy test inside a real container checks one file outside the working
+  copy, a tracked hook, a git clean filter, a read-only round and a cancel.
+- `AGY_SMOKE_ISOLATION=container scripts/live-smoke.sh --apply` passed every
+  step on 24 October 2026 (review 79 s, adversarial review 17 s, plan 93 s,
+  task 25 s, apply check, cancel with no container left).
+- In plan mode inside the container agy used its research subagent; the
+  host policy blocked subagents, the container does not.
+- In-container sign-in with `containers/signin.sh` works (Abe, 24 October
+  2026, after the session expiry): the workforce sign-in completed from the
+  container, the token landed in the container home, and the container
+  smoke then passed every step at commit 47bf8ee. `AGY_ADC_AUTH` is untested: the host's Application
+  Default Credentials file is an `authorized_user` credential with a refresh
+  token, not a workforce federation credential, so the seat-or-pay-as-you-go
+  question for ADC stays open.
+- **The agy sign-in file is a session credential, not an indefinite refresh
+  token.** The token file records `auth_method: gcp` and a `wif_provider`
+  under the workforce pool `thg-bootstrap`, whose `sessionDuration` is
+  `28800s` (eight hours; read with `gcloud iam workforce-pools describe`).
+  Google's documentation says the pool's session duration bounds gcloud
+  sign-in sessions, and that a refresh token expires with the session length
+  and the user must sign in again
+  ([reauthentication](https://docs.cloud.google.com/docs/authentication/reauthentication),
+  [extended session length](https://docs.cloud.google.com/access-context-manager/docs/extended-session-length-for-workforce-identity-federation)).
+  So a copy of the file, in the container home or anywhere else, works for
+  at most eight hours after the sign-in. Abe accepted the copy on that basis
+  on 24 October 2026. Confirmed the same evening: the host sign-in was from
+  about 10:40, and at 18:40:45 jobs in both homes failed at once with
+  `oauth2: "invalid_grant" "Refresh token has expired"` in `agy.log`
+  (reported by the companion as "authentication failed or timed out"). A
+  host `agy` sign-in and `containers/signin.sh` are both needed again after
+  that.
+- Final-head live runs (commit 823252b, 24 October 2026, both smokes at
+  once): container mode passed every step up to and including apply, and
+  its cancel step failed only because the session expired while the
+  background plan was starting; host mode passed review, adversarial review
+  and plan, and its task, apply and cancel steps hit the same expiry. Rerun
+  both smokes after signing in again before relying on them.
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)
@@ -136,7 +197,7 @@ needs Python 3.10+ and packages (pydantic, google-genai, protobuf), so uv.
 Open question for Abe: is Vertex AI billing through ADC acceptable for this
 plugin, instead of the Enterprise seat?
 
-## Containers (research of 24 October 2026; nothing run yet)
+## Containers (research of 24 October 2026, before the live runs above)
 
 - Linux builds exist: `https://antigravity.google/cli/install.sh` installs
   `linux_amd64`, `linux_arm64` and musl variants from a manifest with a

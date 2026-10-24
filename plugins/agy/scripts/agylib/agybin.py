@@ -17,7 +17,9 @@ from typing import Any
 
 AGY_BIN_ENV = "AGY_BIN"
 MIN_VERSION = (1, 1, 12)  # first release where print mode honours --model and --mode
-FORBIDDEN_FLAGS = ("--dangerously-skip-permissions",)
+# Only a container job gets this flag, and only container.wrap adds it:
+# build_command refuses it, so a host-mode command can never carry it.
+SKIP_PERMISSIONS_FLAGS = ("--dangerously-skip-permissions",)
 
 MODEL_ALIASES = {
     "high": "gemini-4-argon-high",
@@ -112,7 +114,7 @@ def build_command(
     if json_schema:
         args += ["--json-schema", str(json_schema)]
     args.append("--print=")
-    for flag in FORBIDDEN_FLAGS:
+    for flag in SKIP_PERMISSIONS_FLAGS:
         if flag in args:
             raise ValueError(f"refusing to pass {flag} to agy")
     return args

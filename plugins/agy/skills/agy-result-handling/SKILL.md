@@ -26,7 +26,7 @@ agy has presented invented text as a verbatim copy of a real file, with wrong na
 
 ## Queued commands
 
-A job in `needs-approval` lists shell commands agy wanted but was not allowed to run. Run each one you would run on your own judgement with your own Bash tool, in the job's working copy shown by `/agy:status <job>`. Your normal permission checks decide. Skip anything you would not run and say why. Save the commands and their output to a file, then `/agy:resume <job> <file>`. If none are worth running, read the result with `/agy:result <job>` instead.
+Only a host-mode job queues commands; a container job runs its own. A job in `needs-approval` lists shell commands agy wanted but was not allowed to run. Run each one you would run on your own judgement with your own Bash tool, in the job's working copy shown by `/agy:status <job>`. Your normal permission checks decide. Skip anything you would not run and say why. Save the commands and their output to a file, then `/agy:resume <job> <file>`. If none are worth running, read the result with `/agy:result <job>` instead.
 
 ## Failures
 

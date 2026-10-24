@@ -1,6 +1,9 @@
-# Experimental image that runs agy against a bind-mounted git worktree.
-# Build context: this directory. certs/ holds the TLS interception roots
-# (git-ignored); copy them from ~/.docker/certs.d/ before building.
+# The image the plugin runs agy in. The companion mounts the job's working
+# copy, state directory, plugin files and agy home at their host paths and
+# sets HOME to that agy home. Build context: this directory. certs/ holds
+# the TLS interception roots (git-ignored); copy them from ~/.docker/certs.d/
+# before building. Pass --build-arg UID=$(id -u) --build-arg GID=$(id -g)
+# when yours differ from the defaults.
 FROM debian:bookworm-slim
 
 COPY certs/ /usr/local/share/ca-certificates/
@@ -25,7 +28,4 @@ RUN curl -fsSL https://antigravity.google/cli/install.sh -o /tmp/install.sh \
 ENV PATH=/opt/agy/bin:${PATH}
 
 USER agent
-# A named volume mounted here takes this directory's owner, so agy can write.
-RUN mkdir -p /home/agent/.gemini
-WORKDIR /workspace
 ENTRYPOINT ["agy"]
