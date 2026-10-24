@@ -120,6 +120,16 @@ Linux and macOS with Python 3.9 and 3.13; the macOS run exercises the real
 They show the plugin handles agy's recorded behaviour, not that a live model
 still behaves that way.
 
+For that, run `scripts/live-smoke.sh --apply` from the source repository on a
+machine where agy is signed in. In a throwaway repository it runs the
+companion's setup, review, adversarial review, plan, task, resume, result,
+apply check and cancel against the real agy, checks each result, and prints
+the approval-round table. `/agy:rescue` itself is not run: it is a Claude
+subagent that calls the same `task` command. Code agy wrote runs only under a
+write sandbox, so on Linux those checks are skipped. It uses your Gemini
+licence, so without `--apply` it only lists the steps. `--with-claude` also
+drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
+
 ## Gotchas
 
 - **Check what agy quotes.** agy has presented invented text as an exact copy
@@ -153,8 +163,8 @@ still behaves that way.
 - **The Antigravity Python SDK** offers real permission callbacks, but it
   bills through Gemini Enterprise Agent Platform (formerly Vertex AI) rather
   than a Gemini Enterprise seat.
-- **Live tests.** Nothing yet checks a live agy and a live Claude together
-  automatically; see Testing.
+- **Live tests in CI.** The live smoke test runs by hand only: a live agy
+  needs a saved seat sign-in, which is a long-lived secret.
 
 ## Licence
 

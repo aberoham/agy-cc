@@ -228,7 +228,11 @@ def cmd_review(args: argparse.Namespace, kind: str = "review") -> int:
         TARGET_LABEL=target["label"],
         TARGET_SUMMARY=context["summary"],
         USER_FOCUS=focus,
-        REVIEW_COLLECTION_GUIDANCE="Use the repository context below as primary evidence.",
+        REVIEW_COLLECTION_GUIDANCE=(
+            "Use the repository context below as primary evidence. Do not use shell commands in this "
+            "job; most are blocked. Use your file tools (read, list, find and search files) to inspect "
+            "the repository."
+        ),
         REVIEW_INPUT=context["content"],
     )
     return start_job(args, kind, message, writable=False, extra={"target": target})
