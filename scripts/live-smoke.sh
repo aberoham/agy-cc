@@ -54,6 +54,7 @@ steps=(
     "plan: returns a plan read from agy's artifact file"
     "task (the engine behind /agy:rescue): edits only its working copy and changes stats.py"
     "resume: if agy queued exactly the requested test command, runs it under a write sandbox and resumes to completion"
+    "follow-up: otherwise a second round with --resume-last must recall a code word from the first"
     "result: shows the task's changed files"
     "check: the fixed average() returns 2.0, run under a write sandbox (macOS only)"
     "apply --check: the task's patch applies to the checkout"
@@ -197,7 +198,10 @@ fi
 # task
 start=${SECONDS}
 rc=0
-out="$(start_job task --model "${model}" --wait-seconds 280 "Fix the off-by-one bug in average() in stats.py. Then run exactly: ${expected}")" || rc=$?
+# Not `tr ... | head`: head's early exit gives tr SIGPIPE, which pipefail
+# turns into a failure and set -e into a silent abort.
+codeword="PELICAN-$("${python}" -c 'import secrets; print(secrets.token_hex(6).upper())')"
+out="$(start_job task --model "${model}" --wait-seconds 280 "Remember the code word ${codeword}. Fix the off-by-one bug in average() in stats.py. Then run exactly: ${expected}")" || rc=$?
 job="$(newest_job task)"
 task_id="$(field "${job}" id)"
 status="$(field "${job}" status)"
@@ -237,6 +241,25 @@ if [[ "${status}" == "needs-approval" ]]; then
     fi
 else
     log "SKIP  resume: the task queued no commands"
+    # A second round on the same job must continue the same agy conversation.
+    # In container mode this is the only place a resume is exercised live.
+    start=${SECONDS}
+    rc=0
+    out="$(start_job task --model "${model}" --wait-seconds 280 --resume-last "What was the code word I gave you earlier? Reply with just the word.")" || rc=$?
+    job="$(newest_job task)"
+    status="$(field "${job}" status)"
+    rounds="$("${python}" -c 'import json,sys; r=json.loads(sys.argv[1]).get("rounds"); print(len(r) if isinstance(r, list) else "?")' "${job}" 2>/dev/null || echo "?")"
+    # The word must appear on its own, not as a prefix of a longer token.
+    recalled=false
+    if printf '%s\n' "${out}" | grep -Eq "(^|[^A-Z0-9-])${codeword}([^A-Z0-9-]|$)"; then
+        recalled=true
+    fi
+    if ((rc == 0)) && [[ "$(field "${job}" id)" == "${task_id}" && "${status}" == "completed" ]] \
+        && [[ "${rounds}" == "2" ]] && ${recalled}; then
+        pass follow-up $((SECONDS - start))
+    else
+        fail follow-up "exit ${rc}, job $(field "${job}" id) ${status:-?} rounds ${rounds}, code word ${codeword} $(${recalled} && echo found || echo missing): ${out:0:300}"
+    fi
 fi
 
 # result
