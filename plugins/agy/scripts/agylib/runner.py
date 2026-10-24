@@ -489,12 +489,13 @@ class JobRunner:
         """The plan artifact's text, or None unless the file really sits under the brain directory.
 
         agy writes the brain directory, so a link planted there could point
-        at any file the host user can read. The real path must stay inside,
+        at any file the host user can read. The real path must stay inside
+        the real brain directory (so a home behind a symlink still works),
         and the file is opened without following a final link.
         """
         root = os.path.realpath(self._plan_root())
         real = os.path.realpath(path)
-        if not real.startswith(root + os.sep) or real != os.path.normpath(str(path)):
+        if not real.startswith(root + os.sep):
             return None
         try:
             fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
