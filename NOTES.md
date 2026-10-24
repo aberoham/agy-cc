@@ -201,7 +201,7 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   and dies with the container, credentials arrive as environment variables,
   and caches are an explicit opt-in mount shown read-only. Jobs now get a
   home seeded from the sign-in home at the start of every round, and the
-  sign-in home is never mounted.
+  sign-in home is mounted only by `containers/signin.sh`, never into a job.
 
 ## Alternative backend: the Antigravity Python SDK
 

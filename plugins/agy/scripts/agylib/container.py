@@ -118,7 +118,9 @@ def seed_home(job_dir: Path) -> Path:
             shutil.copyfile(source / name, target / name)
             os.chmod(target / name, 0o600)
     if not (target / "settings.json").is_file():
-        (target / "settings.json").write_text(DEFAULT_SETTINGS, encoding="utf-8")
+        fd = os.open(target / "settings.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(DEFAULT_SETTINGS)
     return home
 
 
