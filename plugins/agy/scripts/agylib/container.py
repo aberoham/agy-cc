@@ -33,11 +33,27 @@ HOME_ENV = "AGY_CONTAINER_HOME"
 WORKSPACE_PROBE = ".agy-mount-probe-"  # plus a random suffix, see state_mountable
 JOB_MOUNT = "container"  # the one job subdirectory the container may write
 DOCKER_TIMEOUT = 60
-# The working copy was created by the host user; through a virtual machine's
+# Git configuration for every command in the container, agy's included. The
+# working copy was created by the host user; through a virtual machine's
 # shared filesystem its owner can differ from the container's user, and git
 # then refuses the repository as "dubious ownership". Nothing outside the
-# working copy is mounted, so trusting every directory costs nothing.
-GIT_ENV = ("--env=GIT_CONFIG_COUNT=1", "--env=GIT_CONFIG_KEY_0=safe.directory", "--env=GIT_CONFIG_VALUE_0=*")
+# working copy is mounted, so trusting every directory costs nothing. An
+# identity lets agy commit inside the copy if it wants to (only the patch
+# leaves the container), and signing is off because there is no key.
+_GIT_CONFIG = (
+    ("safe.directory", "*"),
+    ("user.name", "agy plugin"),
+    ("user.email", "agy-plugin@localhost"),
+    ("commit.gpgsign", "false"),
+)
+GIT_ENV = (
+    f"--env=GIT_CONFIG_COUNT={len(_GIT_CONFIG)}",
+    *[
+        flag
+        for i, (key, value) in enumerate(_GIT_CONFIG)
+        for flag in (f"--env=GIT_CONFIG_KEY_{i}={key}", f"--env=GIT_CONFIG_VALUE_{i}={value}")
+    ],
+)
 
 
 def docker_bin() -> Path | None:
@@ -88,6 +104,27 @@ def image_present() -> bool:
     return bool(proc and proc.returncode == 0)
 
 
+def image_user() -> str | None:
+    """The image's USER as "uid:gid", or None when it is not numeric or not set."""
+    proc = _docker("image", "inspect", "--format", "{{.Config.User}}", image_name(), timeout=15)
+    if not proc or proc.returncode != 0:
+        return None
+    user = proc.stdout.strip()
+    uid, _, gid = user.partition(":")
+    return user if uid.isdigit() and gid.isdigit() else None
+
+
+def image_user_matches() -> bool:
+    """Whether the image was built for this user.
+
+    Jobs run as the host user so bind-mounted files have one owner, and the
+    image's own files (agy's home skeleton, uv) must belong to that same
+    user. An image with a name for USER, or none, is not checked.
+    """
+    user = image_user()
+    return user is None or user == f"{os.getuid()}:{os.getgid()}"
+
+
 def job_mount(job_dir: Path) -> Path:
     return job_dir / JOB_MOUNT
 
@@ -133,6 +170,8 @@ def report() -> dict[str, object]:
         "docker_reachable": reachable,
         "image": image_name(),
         "image_present": present,
+        "image_user": image_user() if present else None,
+        "image_user_matches": present and image_user_matches(),
         "state_mountable": present and state_mountable(),
         "agy_home": str(agy_home()),
         "container_signed_in": container_token_present(),
@@ -148,6 +187,11 @@ def unavailable_reason(status: dict[str, object] | None = None) -> str | None:
         return "the Docker daemon is not reachable (is Colima or Docker Desktop running?)"
     if not status["image_present"]:
         return f"the image {status['image']} is not built; see containers/ in the plugin's source repository"
+    if not status["image_user_matches"]:
+        return (
+            f"the image {status['image']} was built for user {status['image_user']}, not "
+            f"{os.getuid()}:{os.getgid()}; rebuild it with --build-arg UID=$(id -u) --build-arg GID=$(id -g)"
+        )
     if not status["state_mountable"]:
         return (
             f"the container cannot write to the state directory {state_root()}; "

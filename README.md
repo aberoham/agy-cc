@@ -6,7 +6,7 @@ tracked, isolated background jobs.
 
 - The plugin is in [`plugins/agy`](plugins/agy); its [README](plugins/agy/README.md) covers prerequisites, install, commands and gotchas.
 - [`NOTES.md`](NOTES.md) records how agy 1.4.7 was observed to behave, and the open questions.
-- [`containers/`](containers) holds the image and the sign-in script for container isolation.
+- [`containers/`](containers) holds the image and the sign-in script for container isolation. Its design follows Matt Pocock's [Sandcastle](https://github.com/mattpocock/sandcastle).
 
 Development checks, matching CI:
 
