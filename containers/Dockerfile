@@ -15,6 +15,11 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git jq python3 \
     && update-ca-certificates \
     && apt-get clean
+ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    UV_SYSTEM_CERTS=1 \
+    UV_LINK_MODE=copy \
+    PYTHONDONTWRITEBYTECODE=1
 # uv for Python repositories: agy runs their tests with `uv run`. Its
 # installer is a `curl | sh`, so the binary is asserted in the same layer.
 # UV_SYSTEM_CERTS makes uv trust the interception roots above; the copy link
@@ -23,11 +28,6 @@ RUN curl -LsSf https://astral.sh/uv/install.sh -o /tmp/uv-install.sh \
     && env UV_INSTALL_DIR=/usr/local/bin UV_NO_MODIFY_PATH=1 sh /tmp/uv-install.sh \
     && test -x /usr/local/bin/uv \
     && rm /tmp/uv-install.sh
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
-    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
-    UV_SYSTEM_CERTS=1 \
-    UV_LINK_MODE=copy \
-    PYTHONDONTWRITEBYTECODE=1
 
 # The group id may already exist in the base image (macOS staff is 20, which
 # Debian gives to dialout); the agent user then simply shares it.

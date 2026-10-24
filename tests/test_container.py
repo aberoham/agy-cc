@@ -8,6 +8,7 @@ real container when Docker is reachable.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from agylib import container
@@ -46,13 +47,21 @@ def test_setup_reports_the_container_state(companion, contained):
 
 
 def test_an_image_built_for_another_user_is_refused_with_the_rebuild_command(contained):
+    other = f"{os.getuid() + 1}:{os.getgid() + 1}"
     proc = contained.run(
-        "review", "--isolation", "container", scenario="review", check=False, FAKE_DOCKER_IMAGE_USER="1000:1000"
+        "review", "--isolation", "container", scenario="review", check=False, FAKE_DOCKER_IMAGE_USER=other
     )
     assert proc.returncode == 2
-    assert "built for user 1000:1000" in proc.stderr and "--build-arg UID=$(id -u)" in proc.stderr
-    report = json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER="1000:1000").stdout)
+    assert f"built for user {other}" in proc.stderr and "--build-arg UID=$(id -u)" in proc.stderr
+    report = json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER=other).stdout)
     assert report["image_user_matches"] is False and report["isolation"] == "host"
+    assert f"built for user {other}" in report["container_unavailable"]
+    # A named user cannot be checked and passes; a failed inspection does not.
+    assert json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER="agent").stdout)["image_user_matches"]
+    from agylib import container
+
+    assert container.image_user_matches(None) is False
+    assert container.image_user_matches("") is True
 
 
 def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, repo):

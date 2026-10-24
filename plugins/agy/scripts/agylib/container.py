@@ -105,24 +105,27 @@ def image_present() -> bool:
 
 
 def image_user() -> str | None:
-    """The image's USER as "uid:gid", or None when it is not numeric or not set."""
+    """The image's USER as docker reports it ("501:20", "agent" or ""), or None when the inspection failed."""
     proc = _docker("image", "inspect", "--format", "{{.Config.User}}", image_name(), timeout=15)
     if not proc or proc.returncode != 0:
         return None
-    user = proc.stdout.strip()
-    uid, _, gid = user.partition(":")
-    return user if uid.isdigit() and gid.isdigit() else None
+    return proc.stdout.strip()
 
 
-def image_user_matches() -> bool:
+def image_user_matches(user: str | None) -> bool:
     """Whether the image was built for this user.
 
     Jobs run as the host user so bind-mounted files have one owner, and the
     image's own files (agy's home skeleton, uv) must belong to that same
-    user. An image with a name for USER, or none, is not checked.
+    user. A numeric USER is compared; a name or no USER cannot be checked
+    and passes; a failed inspection does not.
     """
-    user = image_user()
-    return user is None or user == f"{os.getuid()}:{os.getgid()}"
+    if user is None:
+        return False
+    uid, _, gid = user.partition(":")
+    if not (uid.isdigit() and gid.isdigit()):
+        return True
+    return user == f"{os.getuid()}:{os.getgid()}"
 
 
 def job_mount(job_dir: Path) -> Path:
@@ -165,13 +168,14 @@ def report() -> dict[str, object]:
     binary = docker_bin()
     reachable = bool(binary) and daemon_reachable()
     present = reachable and image_present()
+    user = image_user() if present else None
     return {
         "docker": str(binary) if binary else None,
         "docker_reachable": reachable,
         "image": image_name(),
         "image_present": present,
-        "image_user": image_user() if present else None,
-        "image_user_matches": present and image_user_matches(),
+        "image_user": user,
+        "image_user_matches": present and image_user_matches(user),
         "state_mountable": present and state_mountable(),
         "agy_home": str(agy_home()),
         "container_signed_in": container_token_present(),
@@ -188,6 +192,8 @@ def unavailable_reason(status: dict[str, object] | None = None) -> str | None:
     if not status["image_present"]:
         return f"the image {status['image']} is not built; see containers/ in the plugin's source repository"
     if not status["image_user_matches"]:
+        if status["image_user"] is None:
+            return f"docker could not inspect the image {status['image']}"
         return (
             f"the image {status['image']} was built for user {status['image_user']}, not "
             f"{os.getuid()}:{os.getgid()}; rebuild it with --build-arg UID=$(id -u) --build-arg GID=$(id -g)"
