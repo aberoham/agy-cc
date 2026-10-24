@@ -117,6 +117,11 @@ def test_task_in_a_real_container_reaches_only_the_working_copy(image, scratch):
     assert (worktree / "hook-marker").exists()
     assert "filter" in (worktree / ".git" / "config").read_text()
 
+    proc = _companion(scratch, repo, "task", "--resume-last", "--read-only", "look again")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "could not write stats.py: Read-only file system" in proc.stdout
+    assert (worktree / "stats.py").read_text() == "fixed\n"
+
     proc = _companion(scratch, repo, "apply", job["id"])
     assert "Applied" in proc.stdout, proc.stdout + proc.stderr
     assert (repo / "stats.py").read_text() == "fixed\n"

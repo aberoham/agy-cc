@@ -161,12 +161,16 @@ def wrap(
     job_dir: Path,
     plugin_root: Path,
     read_dirs: list[Path],
+    writable: bool,
 ) -> list[str]:
     """The docker command that runs agy's arguments inside the container.
 
     agy_args comes from agybin.build_command without the binary, which the
     image's entrypoint supplies. --init gives the container a real init, so
     the SIGTERM that docker forwards on stop reaches agy and its children.
+    A read-only round (a review, a plan, or a task round with --read-only)
+    mounts the working copy read-only, which is what enforces it: inside the
+    container agy has no permission checks.
     """
     home = agy_home()
     (home / ".gemini").mkdir(parents=True, exist_ok=True)
@@ -184,7 +188,7 @@ def wrap(
         f"--env=HOME={home}",
         "--env=PYTHONDONTWRITEBYTECODE=1",
         *GIT_ENV,
-        f"--volume={worktree}:{worktree}",
+        f"--volume={worktree}:{worktree}" + ("" if writable else ":ro"),
         f"--volume={job_dir}:{job_dir}",
         f"--volume={home}:{home}",
         f"--volume={plugin_root}:{plugin_root}:ro",
@@ -195,7 +199,7 @@ def wrap(
     return command
 
 
-def export_command(worktree: Path, baseline: str, job_dir: Path, plugin_root: Path) -> list[str]:
+def export_command(worktree: Path, baseline: str, job_dir: Path, plugin_root: Path, name: str) -> list[str]:
     """A docker command that computes the job's patch inside the container."""
     binary = docker_bin()
     if not binary:
@@ -205,6 +209,8 @@ def export_command(worktree: Path, baseline: str, job_dir: Path, plugin_root: Pa
         str(binary),
         "run",
         "--rm",
+        "--init",
+        f"--name={name}",
         f"--user={os.getuid()}:{os.getgid()}",
         f"--env=HOME={agy_home()}",
         "--env=PYTHONDONTWRITEBYTECODE=1",

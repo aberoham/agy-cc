@@ -57,7 +57,7 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     assert "touch" in probe and str(state) in " ".join(probe)
     options = _run_options(run)
     volumes = [o[len("--volume=") :] for o in options if o.startswith("--volume=")]
-    assert f"{worktree}:{worktree}" in volumes
+    assert f"{worktree}:{worktree}:ro" in volumes  # a review never edits the copy
     assert f"{home}:{home}" in volumes
     plugin = next(v for v in volumes if v.endswith(":ro") and "plugins/agy" in v)
     assert plugin.split(":")[0] == job["plugin_root"]
@@ -102,6 +102,12 @@ def test_container_task_keeps_repository_hooks_and_exports_from_inside(contained
     # The export ran as a second container, and the host read its output.
     export = contained.docker_runs()[-1]
     assert "_export" in export and "--entrypoint" in export
+    assert f"--name=agy-{job['id']}-1-export" in export and "--init" in export
+    volumes = [o for o in export if o.startswith("--volume=")]
+    assert f"--volume={worktree}:{worktree}" in volumes
+    calls = [json.loads(line) for line in contained.docker_calls.read_text().splitlines()]
+    assert ["rm", "--force", f"agy-{job['id']}-1-export"] in calls
+    assert job["container"] is None
     stored = json.loads((Path(job["worktree"]).parent.parent / "jobs" / job["id"] / "result.json").read_text())
     assert stored["changed_paths"] == [["A", "hook-marker"], ["M", "stats.py"]]
     proc = contained.run("apply", job["id"])
@@ -113,14 +119,24 @@ def test_container_task_keeps_repository_hooks_and_exports_from_inside(contained
 def test_container_task_resumes_in_the_same_copy_and_conversation(contained, repo):
     contained.run("task", "fix the bug", scenario="container")
     first = contained.job()
-    contained.run("task", "--resume-last", "carry on", scenario="container")
+    contained.run("task", "--resume-last", "--read-only", "carry on", scenario="container")
     job = contained.job()
     assert job["id"] == first["id"] and job["status"] == "completed"
     assert [r["kind"] for r in job["rounds"]] == ["initial", "follow-up"]
     calls = contained.agy_calls()
     assert calls[1]["argv"][calls[1]["argv"].index("--conversation") + 1] == job["conversation_id"]
-    names = [o for c in contained.docker_runs() for o in c if o.startswith("--name=")]
-    assert names == [f"--name=agy-{job['id']}-1", f"--name=agy-{job['id']}-2"]
+    assert "mounted read-only" in json.loads(calls[1]["stdin"])["message"]["content"]
+    worktree = job["worktree"]
+    runs = [c for c in contained.docker_runs() if any(o.startswith("--name=agy-") for o in c)]
+    names = [o for c in runs for o in c if o.startswith("--name=")]
+    assert names == [
+        f"--name=agy-{job['id']}-1",
+        f"--name=agy-{job['id']}-1-export",
+        f"--name=agy-{job['id']}-2",
+        f"--name=agy-{job['id']}-2-export",
+    ]
+    assert f"--volume={worktree}:{worktree}" in runs[0]  # the task round edits
+    assert f"--volume={worktree}:{worktree}:ro" in runs[2]  # the read-only round does not
 
 
 def test_cancel_removes_the_container(contained):
@@ -157,6 +173,7 @@ def test_wrap_puts_every_mount_at_its_host_path(tmp_path, monkeypatch):
         job_dir=tmp_path / "job",
         plugin_root=tmp_path / "plugin",
         read_dirs=[tmp_path / "docs"],
+        writable=True,
     )
     assert command[0] == str(tmp_path / "docker")
     assert command[1:4] == ["run", "--rm", "--interactive"]

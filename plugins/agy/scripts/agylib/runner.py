@@ -289,6 +289,7 @@ class JobRunner:
                 job_dir=self.dir,
                 plugin_root=Path(self.job["plugin_root"]),
                 read_dirs=[Path(p) for p in self.job.get("read_dirs") or []],
+                writable=bool(self.job.get("writable")) and not self.job.get("read_only_round"),
             )
         if self.job.get("os_sandbox"):
             command = sandbox.wrap(
@@ -396,7 +397,10 @@ class JobRunner:
             error = outcome.detail
             stderr_tail = _tail(self.dir / "agy.stderr.txt")
             if any(hint in stderr_tail.lower() for hint in AUTH_HINTS):
-                error = "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
+                if self.job.get("isolation") == "container":
+                    error = "agy is not signed in for containers. Run containers/signin.sh in a terminal."
+                else:
+                    error = "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
             stored["stderr_tail"] = stderr_tail
         elif result.get("status") != "SUCCESS":
             error = result.get("error") or f"agy finished with status {result.get('status')}"
@@ -472,8 +476,17 @@ class JobRunner:
             return gitctx.export_changes(worktree, self.job["baseline"])
         for stale in ("changes.patch", "changes.json"):
             (self.dir / stale).unlink(missing_ok=True)
-        command = container.export_command(worktree, self.job["baseline"], self.dir, Path(self.job["plugin_root"]))
-        proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        # The export container is recorded on the job like the turn's, so a
+        # cancel or a session end removes it too; the finally covers a timeout.
+        name = f"{self._container_name()}-export"
+        command = container.export_command(
+            worktree, self.job["baseline"], self.dir, Path(self.job["plugin_root"]), name
+        )
+        self.store.update(self.job_id, lambda r: r.update({"container": name}))
+        try:
+            proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        finally:
+            container.remove(name)
         if proc.returncode != 0:
             raise RuntimeError(f"the export container failed: {proc.stderr.strip()[-500:]}")
         summary = read_json(self.dir / "changes.json")

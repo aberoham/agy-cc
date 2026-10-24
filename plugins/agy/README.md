@@ -73,8 +73,9 @@ directory, the plugin's own files (read-only) and a separate agy home
 machine is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs
 the commands it needs, including your tests, and edits what it likes, and
-all of that lands in the working copy. Reviews and plans still tell agy not
-to change files, and their working copies are discarded.
+all of that lands in the working copy. For a review, a plan or a task round
+with `--read-only`, the working copy is mounted read-only, so agy cannot edit
+it at all.
 
 - The working copy is a self-contained repository (your `HEAD` tree plus your
   changes as its only commit), not a linked worktree, so nothing inside the

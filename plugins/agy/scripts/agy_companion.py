@@ -59,6 +59,10 @@ CONTAINER_REVIEW_GUIDANCE = (
     "Use the repository context below as primary evidence, and inspect the working copy with "
     "your file tools or read-only shell commands. Do not change files."
 )
+READ_ONLY_NOTE = (
+    "\n\nThis round is read-only: the working copy is mounted read-only, so do not try to edit "
+    "files or run commands that write there. Report what you find and what you would change.\n"
+)
 
 
 class UsageError(Exception):
@@ -319,9 +323,15 @@ def cmd_task(args: argparse.Namespace) -> int:
         )
         if not previous:
             raise UsageError("No earlier agy task from this session to resume in this repository.")
+        if args.read_only and previous.get("isolation") == "container":
+            request += READ_ONLY_NOTE
         return continue_job(store, previous, request, "follow-up", args, read_only=args.read_only)
-    shell_rule = CONTAINER_SHELL_RULE if choose_isolation(args) == "container" else HOST_SHELL_RULE
-    message = template("task.md", USER_REQUEST=request, SHELL_RULE=shell_rule)
+    in_container = choose_isolation(args) == "container"
+    message = template(
+        "task.md", USER_REQUEST=request, SHELL_RULE=CONTAINER_SHELL_RULE if in_container else HOST_SHELL_RULE
+    )
+    if args.read_only and in_container:
+        message += READ_ONLY_NOTE
     return start_job(args, "task", message, writable=not args.read_only)
 
 

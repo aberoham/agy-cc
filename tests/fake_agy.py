@@ -286,7 +286,11 @@ def main() -> int:
         # hooks through run_command, and follows probe instructions in the
         # request so a test can see what the container can reach.
         if "--conversation" in argv:
-            result(conversation, "Continued.")
+            try:
+                (cwd / "stats.py").write_text("resumed\n")
+                result(conversation, "Continued and wrote stats.py.")
+            except OSError as exc:
+                result(conversation, f"Continued; could not write stats.py: {exc.strerror}")
             return 0
         notes = []
         for line in message.splitlines():
