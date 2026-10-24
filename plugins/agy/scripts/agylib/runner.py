@@ -429,9 +429,10 @@ class JobRunner:
             stored["review"], stored["parse_error"] = _parse_review(result, schema)
         if kind == "plan" and self.plan_paths:
             plan_file = Path(self.plan_paths[-1])
-            if plan_file.is_file():
+            plan_text = self._read_plan(plan_file)
+            if plan_text is not None:
                 stored["plan_path"] = str(plan_file)
-                stored["plan_markdown"] = plan_file.read_text(encoding="utf-8", errors="replace")
+                stored["plan_markdown"] = plan_text
         if self.job.get("writable"):
             patch_file = self.dir / "changes.patch"
             if patch_file.exists():
@@ -483,6 +484,24 @@ class JobRunner:
         if self.job.get("kind") != "task" and record.get("status") in ("completed", "failed", "cancelled"):
             gitctx.remove_worktree(self.job["repo_root"], Path(self.job["worktree"]))
         return record
+
+    def _read_plan(self, path: Path) -> str | None:
+        """The plan artifact's text, or None unless the file really sits under the brain directory.
+
+        agy writes the brain directory, so a link planted there could point
+        at any file the host user can read. The real path must stay inside,
+        and the file is opened without following a final link.
+        """
+        root = os.path.realpath(self._plan_root())
+        real = os.path.realpath(path)
+        if not real.startswith(root + os.sep) or real != os.path.normpath(str(path)):
+            return None
+        try:
+            fd = os.open(real, os.O_RDONLY | os.O_NOFOLLOW)
+        except OSError:
+            return None
+        with os.fdopen(fd, "rb") as handle:
+            return handle.read().decode("utf-8", errors="replace")
 
     def _export_changes(self) -> dict[str, Any]:
         """agy's changes as a patch. A container job computes it inside the
@@ -637,20 +656,23 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
                 groups.add(group)
     for group in groups:
         _signal_group(group, signal.SIGTERM)
-    # Containers after the signals, so a slow Docker daemon never delays them,
-    # and within the same grace period so a session-end hook stays in budget.
-    for name in containers:
-        container.remove(name, timeout=max(grace, 3))
-    if not groups:
-        return bool(containers)
+    # Containers after the signals, all at once and under the same deadline,
+    # so a slow Docker daemon neither delays the signals nor stretches a
+    # session-end hook past its budget.
     deadline = time.monotonic() + grace
+    removals = [
+        threading.Thread(target=container.remove, args=(name,), kwargs={"timeout": grace}, daemon=True)
+        for name in containers
+    ]
+    for thread in removals:
+        thread.start()
     while time.monotonic() < deadline:
-        if not any(_signal_group(group, 0) for group in groups):
-            return True
+        if not any(_signal_group(group, 0) for group in groups) and not any(t.is_alive() for t in removals):
+            return bool(groups or containers)
         time.sleep(0.2)
     for group in groups:
         _signal_group(group, signal.SIGKILL)
-    return True
+    return bool(groups or containers)
 
 
 __all__ = ["JobRunner", "run_turn", "terminate_job_processes", "read_json"]

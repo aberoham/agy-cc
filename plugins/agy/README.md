@@ -93,12 +93,13 @@ it at all.
   user namespaces it needs); the container is the boundary.
 
 What the container does not change: agy still has the network, because it
-must reach Google, so a prompt injection in the repository can send the
-repository's contents out. The repository already goes to Google for the
-review, so the loss is bounded to the repository, but it is not zero. The
-container sign-in in the container home is a credential like the one in
-your own `~/.gemini`; with workforce identity federation it expires with the
-pool's session duration (see `NOTES.md`). And a Docker virtual machine on
+must reach Google, so a prompt injection in the repository can send out
+anything the container can read: the repository, any `--read-dir`
+directory, and the container sign-in in the container home. The repository
+already goes to Google for the review, so that part is not new, but it is
+not nothing. The container sign-in is a credential like the one in your own
+`~/.gemini`; with workforce identity federation it expires with the pool's
+session duration (see `NOTES.md`). And a Docker virtual machine on
 macOS shares only some directories: the plugin's state directory and the
 container home must be under your home (Colima's default share), which
 `/agy:setup` checks.
