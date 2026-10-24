@@ -16,6 +16,7 @@ host never runs git over files agy has written.
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,7 +27,7 @@ from .state import state_root
 IMAGE_ENV = "AGY_IMAGE"
 DEFAULT_IMAGE = "agy-sandbox:experiment"
 HOME_ENV = "AGY_CONTAINER_HOME"
-WORKSPACE_PROBE = ".agy-mount-probe"
+WORKSPACE_PROBE = ".agy-mount-probe-"  # plus a random suffix, see state_mountable
 DOCKER_TIMEOUT = 60
 # The working copy was created by the host user; through a virtual machine's
 # shared filesystem its owner can differ from the container's user, and git
@@ -89,11 +90,14 @@ def state_mountable() -> bool:
     A Docker virtual machine on macOS shares only some host directories
     (Colima shares the home directory, not /var/folders), so a state root in
     the system temporary directory cannot hold a job. The probe touches a
-    file in the state root from inside the container.
+    file in the state root from inside the container. Its name is fresh each
+    time: the virtual machine's shared filesystem caches a file the host has
+    since deleted, and touching that name again creates nothing the host can
+    see.
     """
     root = state_root()
     root.mkdir(parents=True, exist_ok=True)
-    probe = root / WORKSPACE_PROBE
+    probe = root / (WORKSPACE_PROBE + secrets.token_hex(4))
     proc = _docker(
         "run",
         "--rm",
