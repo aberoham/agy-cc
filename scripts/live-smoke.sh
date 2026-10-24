@@ -198,7 +198,9 @@ fi
 # task
 start=${SECONDS}
 rc=0
-codeword="PELICAN-$(LC_ALL=C tr -dc 'A-Z0-9' </dev/urandom | head -c 12)"
+# Not `tr ... | head`: head's early exit gives tr SIGPIPE, which pipefail
+# turns into a failure and set -e into a silent abort.
+codeword="PELICAN-$("${python}" -c 'import secrets; print(secrets.token_hex(6).upper())')"
 out="$(start_job task --model "${model}" --wait-seconds 280 "Remember the code word ${codeword}. Fix the off-by-one bug in average() in stats.py. Then run exactly: ${expected}")" || rc=$?
 job="$(newest_job task)"
 task_id="$(field "${job}" id)"
