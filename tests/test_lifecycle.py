@@ -95,7 +95,7 @@ def test_resume_last_read_only_blocks_writes(companion, repo):
     (worktree / "stats.py").write_text("reset\n")
     companion.run("task", NO_SANDBOX, "--resume-last", "--read-only", "look again", scenario="task")
     job = companion.job()
-    assert job["writable"] is False
+    assert job["writable"] is True and job["read_only_round"] is True
     assert (worktree / "stats.py").read_text() == "reset\n"
 
 

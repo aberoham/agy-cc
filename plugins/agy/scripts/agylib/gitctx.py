@@ -11,16 +11,21 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 from typing import Any
 
 MAX_UNTRACKED_BYTES = 256 * 1024
 MAX_INLINE_DIFF_BYTES = 400 * 1024
-HOOKS_PATH = os.path.join(".agents", "hooks.json")
-# Files that commands run in a job's working copy leave behind; never exported.
+AGENTS_DIR = ".agents"
+HOOKS_PATH = os.path.join(AGENTS_DIR, "hooks.json")
+# Never exported: the .agents directory, which install_hooks reserves for the
+# plugin's own hook (matched case-insensitively, as a case-insensitive
+# filesystem would), and files that commands run in the working copy leave
+# behind.
 EXPORT_EXCLUDES = (
-    f":(exclude){HOOKS_PATH}",
+    f":(exclude,icase,glob){AGENTS_DIR}/**",
     ":(exclude,glob)**/__pycache__/**",
     ":(exclude,glob)**/*.pyc",
     ":(exclude,glob)**/.pytest_cache/**",
@@ -35,8 +40,39 @@ class GitError(RuntimeError):
 # The plugin's own git calls run outside every sandbox, so they must not run
 # programs the repository configures: hooks (post-checkout and post-commit run
 # even with --no-verify) and the fsmonitor helper. Diff commands also pass
-# --no-ext-diff and --no-textconv.
-SAFE_GIT = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"]
+# --no-ext-diff and --no-textconv. The remaining settings keep the output
+# machine-readable whatever the user's own configuration says: colour would
+# corrupt the patches that create_worktree and export_changes feed to git
+# apply, line-ending conversion would make `git add` refuse agy's files, and
+# commit signing would make the baseline commit prompt or fail.
+SAFE_GIT = [
+    "git",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "color.ui=false",
+    "-c",
+    "color.diff=false",
+    "-c",
+    "color.status=false",
+    "-c",
+    "core.autocrlf=false",
+    "-c",
+    "core.safecrlf=false",
+    "-c",
+    "diff.orderFile=/dev/null",
+    "-c",
+    "commit.gpgsign=false",
+    "-c",
+    "log.showSignature=false",
+]
+# Options for every diff whose output is applied or shown as a patch. Each
+# pins a detail that diff.* configuration could otherwise change: the a/ b/
+# prefixes and the amount of context. (The order file is pinned in SAFE_GIT,
+# because commit reads it too.)
+PATCH_FORMAT = ["--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "--unified=3"]
 
 
 def git(cwd: str | Path, *args: str, check: bool = True, input_bytes: bytes | None = None) -> str:
@@ -108,15 +144,23 @@ def _section(title: str, body: str) -> str:
 
 def _untracked_body(cwd: Path, rel: str) -> str:
     path = cwd / rel
+    if path.is_symlink():
+        # The link's target may lie outside the repository, where the job's
+        # read policy would not let agy look, so only the link text goes in.
+        return f"### {rel}\n(symlink to {os.readlink(path)})"
     try:
-        size = path.stat().st_size
+        # O_NOFOLLOW closes the gap between the check above and the open;
+        # fstat on the open descriptor keeps devices and directories out.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
         return f"### {rel}\n(skipped: unreadable)"
-    if path.is_dir():
-        return f"### {rel}\n(skipped: directory)"
-    if size > MAX_UNTRACKED_BYTES:
-        return f"### {rel}\n(skipped: {size} bytes)"
-    data = path.read_bytes()
+    with os.fdopen(fd, "rb") as handle:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            return f"### {rel}\n(skipped: not a regular file)"
+        if info.st_size > MAX_UNTRACKED_BYTES:
+            return f"### {rel}\n(skipped: {info.st_size} bytes)"
+        data = handle.read(MAX_UNTRACKED_BYTES)
     if b"\0" in data[:8192]:
         return f"### {rel}\n(skipped: binary)"
     return f"### {rel}\n```\n{data.decode(errors='replace').rstrip()}\n```"
@@ -127,8 +171,8 @@ def collect_context(cwd: str | Path, target: dict[str, Any]) -> dict[str, Any]:
     root = repo_root(cwd)
     if target["mode"] == "working-tree":
         status = git(root, "status", "--short", "--untracked-files=all")
-        staged = git(root, "diff", "--cached", "--no-ext-diff", "--no-textconv")
-        unstaged = git(root, "diff", "--no-ext-diff", "--no-textconv")
+        staged = git(root, "diff", "--cached", *PATCH_FORMAT)
+        unstaged = git(root, "diff", *PATCH_FORMAT)
         untracked = untracked_files(root)
         files = sorted(set(git(root, "diff", "--name-only", "HEAD").split() if has_head(root) else []) | set(untracked))
         diff = staged + unstaged
@@ -151,7 +195,7 @@ def collect_context(cwd: str | Path, target: dict[str, Any]) -> dict[str, Any]:
         files = git(root, "diff", "--name-only", rng).split()
         log = git(root, "log", "--oneline", rng)
         stat = git(root, "diff", "--stat", rng)
-        diff = git(root, "diff", "--no-ext-diff", "--no-textconv", rng)
+        diff = git(root, "diff", *PATCH_FORMAT, rng)
         parts = [_section("Commit log", log), _section("Diff stat", stat)]
         if len(diff.encode()) <= MAX_INLINE_DIFF_BYTES:
             parts.append(_section("Branch diff", diff))
@@ -161,14 +205,45 @@ def collect_context(cwd: str | Path, target: dict[str, Any]) -> dict[str, Any]:
     return {"summary": summary, "files": files, "content": "\n".join(parts)}
 
 
-def create_worktree(cwd: str | Path, dest: Path) -> str:
-    """Make a detached worktree of HEAD plus the user's changes; return the baseline commit."""
+def create_worktree(cwd: str | Path, dest: Path, hook_command: str | None = None) -> str:
+    """Make a detached worktree of HEAD plus the user's changes; return the baseline commit.
+
+    The plugin's hook is installed before the baseline is committed, so the
+    baseline already holds the emptied .agents directory and the hook file.
+    A later export diffs against the baseline and therefore cannot show the
+    removal of the repository's own .agents files, whatever the filesystem
+    maps that name to. On any failure the worktree is removed again.
+    """
     root = repo_root(cwd)
     if not has_head(root):
         raise GitError("the repository has no commits yet")
     dest.parent.mkdir(parents=True, exist_ok=True)
     git(root, "worktree", "add", "--detach", "--quiet", str(dest), "HEAD")
-    patch = git_bytes(root, "diff", "--binary", "--full-index", "--no-ext-diff", "--no-textconv", "HEAD")
+    try:
+        _populate_worktree(root, dest)
+        if hook_command is not None:
+            install_hooks(dest, hook_command)
+        git(dest, "add", "-A")
+        git(
+            dest,
+            *BASELINE_IDENTITY,
+            "commit",
+            "--quiet",
+            "--no-verify",
+            "--allow-empty",
+            "--cleanup=verbatim",  # commit.cleanup with an odd core.commentChar could empty the message
+            "-m",
+            "agy job baseline",
+        )
+        return git(dest, "rev-parse", "HEAD").strip()
+    except Exception:
+        remove_worktree(root, dest)
+        raise
+
+
+def _populate_worktree(root: Path, dest: Path) -> None:
+    """Copy the user's uncommitted and untracked changes into the fresh worktree."""
+    patch = git_bytes(root, "diff", "--binary", "--full-index", *PATCH_FORMAT, "HEAD")
     if patch.strip():
         git(dest, "apply", "--binary", "--whitespace=nowarn", input_bytes=patch)
     for rel in untracked_files(root):
@@ -179,46 +254,42 @@ def create_worktree(cwd: str | Path, dest: Path) -> str:
             os.symlink(os.readlink(source), target)  # copy the link, never its target
         elif source.is_file():
             shutil.copy2(source, target)
-    git(dest, "add", "-A")
-    git(
-        dest,
-        *BASELINE_IDENTITY,
-        "commit",
-        "--quiet",
-        "--no-verify",
-        "--allow-empty",
-        "-m",
-        "agy job baseline",
-    )
-    return git(dest, "rev-parse", "HEAD").strip()
 
 
 def install_hooks(dest: Path, hook_command: str) -> None:
-    """Add the plugin's PreToolUse hook to the worktree, keeping any existing hooks.
+    """Make the plugin's PreToolUse hook the only agy configuration in the worktree.
 
-    A symlinked .agents or hooks.json could point back into the user's
-    checkout, so the job refuses to start rather than write through it.
+    agy runs every hook in the workspace's .agents directory for every tool
+    call, from .agents/hooks.json and from each workspace plugin under
+    .agents/plugins, outside the plugin's policy and outside any sandbox. A
+    repository that tracks such files would therefore run programs it chose,
+    including on a branch checked out only to review it. So the worktree's
+    .agents directory is emptied and holds only the plugin's hook. This runs
+    before the baseline commit, so the user's copy is never touched and the
+    change never reaches an export; the export also excludes the directory, so
+    agy's edits there, if any, are not applied either.
+
+    A symlinked .agents could point back into the user's checkout, so the job
+    refuses to start rather than remove or write through it.
     """
+    agents = dest / AGENTS_DIR
+    if agents.is_symlink():
+        raise GitError(f"{AGENTS_DIR} is a symlink; agy jobs cannot run in this repository")
+    if agents.exists():
+        shutil.rmtree(agents)
     path = dest / HOOKS_PATH
-    for candidate in (path.parent, path):
-        if candidate.is_symlink():
-            raise GitError(f"{candidate.relative_to(dest)} is a symlink; agy jobs cannot run in this repository")
-    try:
-        existing = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(existing, dict):
-            existing = {}
-    except (OSError, ValueError):
-        existing = {}
-    existing["agy-plugin-policy"] = {
-        "PreToolUse": [
-            {
-                "matcher": ".*",
-                "hooks": [{"type": "command", "command": hook_command, "timeout": 30}],
-            }
-        ]
+    hooks = {
+        "agy-plugin-policy": {
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [{"type": "command", "command": hook_command, "timeout": 30}],
+                }
+            ]
+        }
     }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+    path.write_text(json.dumps(hooks, indent=2) + "\n", encoding="utf-8")
 
 
 def export_changes(dest: Path, baseline: str) -> dict[str, Any]:
@@ -235,8 +306,7 @@ def export_changes(dest: Path, baseline: str) -> dict[str, Any]:
             "--cached",
             "--binary",
             "--full-index",
-            "--no-ext-diff",
-            "--no-textconv",
+            *PATCH_FORMAT,
             baseline,
             "--",
             ".",

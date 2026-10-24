@@ -351,10 +351,15 @@ class JobRunner:
         commands = list(dict.fromkeys(c for c in commands if c))
         round_record["queued_commands"] = commands
 
+        # With --json-schema the reply may be only in structured_output; keep
+        # it readable as text in case it fails the shape check below.
+        response = result.get("response") or ""
+        if not response and "structured_output" in result:
+            response = json.dumps(result["structured_output"], indent=2)
         stored: dict[str, Any] = {
             "kind": self.job["kind"],
             "agy_status": result.get("status"),
-            "response": result.get("response", ""),
+            "response": response,
             "error": result.get("error"),
             "usage": result.get("usage"),
             "denied_actions": result.get("denied_actions"),
@@ -371,8 +376,11 @@ class JobRunner:
             error = result.get("error") or f"agy finished with status {result.get('status')}"
 
         kind = self.job["kind"]
-        if kind in ("review", "adversarial-review") and error is None:
-            stored["review"], stored["parse_error"] = _parse_review(result)
+        # agy can report an error (a stream idle timeout, seen live) and still
+        # deliver the whole reply, so a review is parsed whenever there is one.
+        if kind in ("review", "adversarial-review") and (error is None or response):
+            schema = read_json(Path(self.job["json_schema"]), {}) if self.job.get("json_schema") else {}
+            stored["review"], stored["parse_error"] = _parse_review(result, schema)
         if kind == "plan" and self.plan_paths:
             plan_file = Path(self.plan_paths[-1])
             if plan_file.is_file():
@@ -430,10 +438,10 @@ class JobRunner:
         return record
 
 
-def _parse_review(result: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+def _parse_review(result: dict[str, Any], schema: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
     structured = result.get("structured_output")
     if isinstance(structured, dict):
-        return structured, None
+        return _checked_review(structured, schema)
     text = str(result.get("response", "")).strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -445,7 +453,56 @@ def _parse_review(result: dict[str, Any]) -> tuple[dict[str, Any] | None, str | 
         value = json.loads(text[start : end + 1])
     except ValueError as exc:
         return None, f"agy returned invalid JSON: {exc}"
-    return (value, None) if isinstance(value, dict) else (None, "agy returned JSON that is not an object")
+    if not isinstance(value, dict):
+        return None, "agy returned JSON that is not an object"
+    return _checked_review(value, schema)
+
+
+def _checked_review(review: dict[str, Any], schema: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Accept a review only when it has the schema's required keys and types.
+
+    Enumerations and bounds are not enforced: a review with an unexpected
+    severity word is still worth showing, while a wrong type would make the
+    rendering fail or print nonsense. On rejection the reply is shown raw.
+    """
+    problem = _type_mismatch(review, schema, "review")
+    if problem:
+        return None, f"agy returned a review that does not match the schema: {problem}"
+    return review, None
+
+
+JSON_TYPES = {
+    "object": dict,
+    "array": list,
+    "string": str,
+    "integer": int,
+    "number": (int, float),
+    "boolean": bool,
+}
+
+
+def _type_mismatch(value: Any, schema: dict[str, Any], where: str) -> str | None:
+    """Describe the first place value's types or required keys differ from schema, or None."""
+    expected = schema.get("type")
+    if expected in JSON_TYPES and (
+        not isinstance(value, JSON_TYPES[expected]) or isinstance(value, bool) != (expected == "boolean")
+    ):
+        return f"{where} should be {'an' if expected[0] in 'aeiou' else 'a'} {expected}"
+    if expected == "object":
+        for key in schema.get("required", []):
+            if key not in value:
+                return f"{where} lacks {key}"
+        for key, subschema in schema.get("properties", {}).items():
+            if key in value:
+                problem = _type_mismatch(value[key], subschema, f"{where}.{key}")
+                if problem:
+                    return problem
+    if expected == "array" and "items" in schema:
+        for index, item in enumerate(value):
+            problem = _type_mismatch(item, schema["items"], f"{where}[{index}]")
+            if problem:
+                return problem
+    return None
 
 
 def _read_lines(path: Path) -> list[dict[str, Any]]:
@@ -472,6 +529,15 @@ def _tail(path: Path, limit: int = 2000) -> str:
     return data[-limit:].decode("utf-8", errors="replace")
 
 
+def _command_line(pid: int) -> str:
+    """The process's command line, or "" when it cannot be read, so that it is never signalled."""
+    try:
+        proc = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True)
+    except OSError:
+        return ""
+    return proc.stdout if proc.returncode == 0 else ""
+
+
 def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRACE_SECONDS) -> bool:
     """Stop the workers and agy process groups of several jobs at once,
     escalating to SIGKILL after one shared grace period."""
@@ -479,11 +545,20 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
     for job in jobs:
         for key in ("pid", "agy_pid"):
             pid = job.get(key)
-            if pid:
-                try:
-                    groups.add(os.getpgid(int(pid)))
-                except (ProcessLookupError, PermissionError, ValueError):
-                    continue
+            if not pid:
+                continue
+            try:
+                group = os.getpgid(int(pid))
+            except (ProcessLookupError, PermissionError, ValueError):
+                continue
+            # Both processes were started with start_new_session, so a live one
+            # leads its own group and carries the job id on its command line
+            # (the worker as an argument, agy in its --log-file path). A stale
+            # record whose pid the system has since given to another process
+            # fails these tests, and signalling that process's group would
+            # stop the user's own programs.
+            if group == int(pid) and str(job.get("id", "")) in _command_line(int(pid)):
+                groups.add(group)
     if not groups:
         return False
     for group in groups:

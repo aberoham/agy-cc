@@ -219,6 +219,15 @@ def main() -> int:
         time.sleep(3600)
         return 0
 
+    if scenario == "review-error-with-response":
+        review = {"verdict": "needs-attention", "summary": "Late but whole.", "findings": [], "next_steps": []}
+        result(conversation, json.dumps(review), status="ERROR", error="API error: stream idle timeout (5m0s)")
+        return 0
+
+    if scenario == "review-empty-structured":
+        result(conversation, "", structured_output={})
+        return 0
+
     if scenario == "review":
         review = {
             "verdict": "needs-attention",

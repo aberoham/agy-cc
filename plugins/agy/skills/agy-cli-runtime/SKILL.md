@@ -14,7 +14,7 @@ Helper: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py" task [--backgr
 - One `task` call per handoff. Do not call `review`, `plan`, `status`, `result`, `cancel`, `resume` or `apply`.
 - `--background` returns a job id at once. Without it the companion waits up to 100 seconds, then reports that the job is still running; check `/agy:status` after that.
 - A task job edits a detached git worktree under the plugin's state directory. The user's checkout changes only when they run `/agy:apply`.
-- `--resume-last` continues the newest finished task in this repository, in the same working copy and agy conversation.
+- `--resume-last` continues the newest finished task this Claude session started in this repository, in the same working copy and agy conversation. With `--read-only` that round cannot edit, but the task's earlier edits stay applicable.
 
 ## Gotchas
 

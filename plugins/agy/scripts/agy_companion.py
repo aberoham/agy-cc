@@ -27,6 +27,7 @@ from agylib.runner import JobRunner, terminate_job_processes  # noqa: E402
 from agylib.state import (  # noqa: E402
     ACTIVE_STATUSES,
     SESSION_ID_ENV,
+    STATE_DIR_ENV,
     TERMINAL_STATUSES,
     JobStore,
     new_job_id,
@@ -35,6 +36,7 @@ from agylib.state import (  # noqa: E402
     read_json,
     record_session_job,
     session_index,
+    state_root,
     write_json,
 )
 
@@ -127,10 +129,8 @@ def start_job(
     job_id = new_job_id(kind)
     job_dir = store.jobs / job_id
     worktree = store.dir / "worktrees" / job_id
-    baseline = gitctx.create_worktree(root, worktree)
+    baseline = gitctx.create_worktree(root, worktree, hook_command(job_dir))
     try:
-        hook = " ".join(shlex.quote(p) for p in (sys.executable, str(SCRIPTS / "agy_hook.py"), str(job_dir)))
-        gitctx.install_hooks(worktree, hook)
         git_admin = Path(gitctx.git(worktree, "rev-parse", "--absolute-git-dir").strip())
     except Exception:
         gitctx.remove_worktree(root, worktree)
@@ -171,10 +171,14 @@ def start_job(
     return wait_or_report(store, job_id, args)
 
 
+def hook_command(job_dir: Path) -> str:
+    return " ".join(shlex.quote(p) for p in (sys.executable, str(SCRIPTS / "agy_hook.py"), str(job_dir)))
+
+
 def policy_for(record: dict[str, Any]) -> dict[str, Any]:
     return {
         "kind": record["kind"],
-        "writable": record["writable"],
+        "writable": bool(record["writable"]) and not record.get("read_only_round"),
         "worktree": record["worktree"],
         "read_dirs": record.get("read_dirs") or [],
     }
@@ -251,15 +255,16 @@ def cmd_task(args: argparse.Namespace) -> int:
         raise UsageError("Say what agy should do.")
     store = JobStore(gitctx.repo_root(os.getcwd()))
     if args.resume_last:
-        previous = store.resolve(
-            None,
+        previous = resolve_own_job(
+            store,
+            args,
             lambda r: (
                 r.get("kind") == "task" and r.get("status") in TERMINAL_STATUSES and bool(r.get("conversation_id"))
             ),
         )
         if not previous:
-            raise UsageError("No earlier agy task to resume in this repository.")
-        return continue_job(store, previous, request, "follow-up", args, writable=False if args.read_only else None)
+            raise UsageError("No earlier agy task from this session to resume in this repository.")
+        return continue_job(store, previous, request, "follow-up", args, read_only=args.read_only)
     return start_job(args, "task", template("task.md", USER_REQUEST=request), writable=not args.read_only)
 
 
@@ -269,10 +274,15 @@ def continue_job(
     message: str,
     round_kind: str,
     args: argparse.Namespace,
-    writable: bool | None = None,
+    read_only: bool | None = None,
 ) -> int:
     """Queue another turn on a finished job. The status check and the change
-    to "queued" happen under the job's lock, so two resumes cannot both run."""
+    to "queued" happen under the job's lock, so two resumes cannot both run.
+
+    read_only applies to this round's tool policy only; None keeps the
+    previous round's setting, as an approval resume continues that round. The
+    job's own "writable" flag is left alone, so the export after the round and
+    /agy:apply still see the edits earlier rounds made."""
     job_id = job["id"]
     if not Path(job.get("worktree") or "").is_dir():
         raise UsageError(f"Job {job_id}'s working copy no longer exists; start a new job.")
@@ -293,13 +303,19 @@ def continue_job(
         )
         if getattr(args, "model", None):
             record["model"] = agybin.resolve_model(args.model)
-        if writable is not None:
-            record["writable"] = writable
+        if read_only is not None:
+            record["read_only_round"] = read_only
         record["generation"] = int(record.get("generation") or 1) + 1
         record.update({"pid": None, "agy_pid": None})
 
     record = store.update(job_id, mutate)
     job_dir = store.job_dir(job_id)
+    try:
+        gitctx.install_hooks(Path(record["worktree"]), hook_command(job_dir))  # .agents holds only the hook again
+    except Exception as exc:
+        error = f"could not prepare the working copy: {exc}"
+        store.update(job_id, lambda r: r.update({"status": "failed", "phase": "failed", "error": error}))
+        raise
     write_json(job_dir / "policy.json", policy_for(record))
     (job_dir / "next-message.md").write_text(message, encoding="utf-8")
     spawn_worker(store, job_id)
@@ -368,9 +384,25 @@ def cmd_worker(args: argparse.Namespace) -> int:
 
 def _session_filter(args: argparse.Namespace):
     session = os.environ.get(SESSION_ID_ENV)
-    if args.all or not session:
+    if getattr(args, "all", False) or not session:
         return None
     return lambda r: r.get("session_id") in (session, None)
+
+
+def resolve_own_job(store: JobStore, args: argparse.Namespace, predicate) -> dict[str, Any] | None:
+    """Resolve a job id, or with none given the newest match from this Claude session.
+
+    Job state is shared per repository, so without the session filter a bare
+    /agy:cancel or /agy:apply in one session would act on another session's
+    job, one that /agy:status in this session does not even show.
+    """
+    reference = getattr(args, "job", None)
+    if reference:
+        return store.resolve(reference, predicate)
+    own = _session_filter(args)
+    if own is None:
+        return store.resolve(None, predicate)
+    return store.resolve(None, lambda r: own(r) and (predicate is None or predicate(r)))
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -393,18 +425,18 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_result(args: argparse.Namespace) -> int:
     store = JobStore(os.getcwd())
-    job = store.resolve(args.job, None if args.job else (lambda r: r.get("status") in TERMINAL_STATUSES))
+    job = resolve_own_job(store, args, None if args.job else (lambda r: r.get("status") in TERMINAL_STATUSES))
     if not job:
-        raise UsageError("No finished agy job found.")
+        raise UsageError("No finished agy job from this session found.")
     print(render.result_text(job, read_json(store.job_dir(job["id"]) / "result.json")))
     return 0
 
 
 def cmd_cancel(args: argparse.Namespace) -> int:
     store = JobStore(os.getcwd())
-    job = store.resolve(args.job, lambda r: r.get("status") in ACTIVE_STATUSES)
+    job = resolve_own_job(store, args, lambda r: r.get("status") in ACTIVE_STATUSES)
     if not job:
-        raise UsageError("No running agy job to cancel.")
+        raise UsageError("No running agy job from this session to cancel.")
     cancel_job(store, job, "cancelled")
     print(f"Cancelled {job['id']}.")
     return 0
@@ -446,9 +478,9 @@ def stop_jobs(jobs: list[tuple[JobStore, dict[str, Any]]], phase: str, grace: fl
 
 def cmd_apply(args: argparse.Namespace) -> int:
     store = JobStore(os.getcwd())
-    job = store.resolve(args.job, lambda r: bool(r.get("writable")) and r.get("status") in TERMINAL_STATUSES)
+    job = resolve_own_job(store, args, lambda r: bool(r.get("writable")) and r.get("status") in TERMINAL_STATUSES)
     if not job:
-        raise UsageError("No finished agy task with changes found.")
+        raise UsageError("No finished agy task with changes from this session found.")
     job_dir = store.job_dir(job["id"])
     patch_file = job_dir / "changes.patch"
     patch = patch_file.read_bytes() if patch_file.exists() else b""
@@ -495,12 +527,19 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
 
 
 def cmd_session_start(args: argparse.Namespace) -> int:
+    """Give the session's commands the same state root the hooks use.
+
+    Claude Code exports CLAUDE_PLUGIN_DATA to hook processes but not to the
+    Bash tool, so without this the session-end hook would look for the
+    session's jobs in a directory the commands never wrote to.
+    """
     payload = json.load(sys.stdin) if not sys.stdin.isatty() else {}
     env_file = os.environ.get("CLAUDE_ENV_FILE")
     session = payload.get("session_id")
     if env_file and session:
         with open(env_file, "a", encoding="utf-8") as handle:
             handle.write(f"export {SESSION_ID_ENV}={shlex.quote(session)}\n")
+            handle.write(f"export {STATE_DIR_ENV}={shlex.quote(str(state_root()))}\n")
     return 0
 
 
