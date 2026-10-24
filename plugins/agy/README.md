@@ -55,18 +55,30 @@ the prompt. The plugin does not rely on it. Each job gets three layers:
 1. **A separate working copy.** A detached git worktree of your `HEAD`, with
    your uncommitted and untracked changes copied in. It lives in the plugin's
    state directory, not in your repository. The plugin's own git calls turn
-   off repository hooks and the fsmonitor helper, so setting up the copy runs
-   no program your repository configures.
+   off repository hooks, the fsmonitor helper and commit signing, so setting
+   up the copy runs no program your repository configures, and they pin the
+   patch format so your diff and colour settings cannot break it.
 2. **A tool policy.** The plugin installs an agy `PreToolUse` hook in that
-   working copy.
+   working copy. The copy's `.agents` directory is emptied first and holds
+   only that hook, because agy would otherwise run any hooks and workspace
+   plugins the repository tracks there on every tool call, outside the policy
+   and the sandbox. Your own `.agents` directory is not touched, and edits
+   agy makes under `.agents` are not exported.
    - Reads are limited to the working copy and agy's artifact directory. To
      let agy read another directory, pass `--read-dir <path>` (repeatable);
-     the prompt tells agy it may read there.
+     the prompt tells agy it may read there. A shell command runs without
+     Claude only when its program and every option are on a short
+     allow-list (`ls`, `cat`, `head`, `tail`, `wc`, `grep`, `find`, `stat`,
+     `pwd`, `echo`) and every path it names stays inside those directories.
+     A `~` or glob, an option that follows symlinks or reads a list of
+     further files, or a file name attached to an option sends the command
+     to Claude instead.
    - Reviews and plans may write only agy's own plan artifact. Tasks may write
-     only inside the working copy, and never its `.git` or the hook file.
+     only inside the working copy, and never its `.git` or `.agents`
+     directory, under any spelling the filesystem maps to them.
    - Web, browser, MCP and subagent tools are blocked in every job.
-   - A symlinked `.agents` directory or hook file stops the job before it
-     starts, so the plugin never writes through a link into your checkout.
+   - A symlinked `.agents` directory stops the job before it starts, so the
+     plugin never removes or writes through a link into your checkout.
 3. **A write sandbox on macOS.** agy runs under `sandbox-exec`. It may write
    only to the working copy, `~/.gemini`, the job's state directory and
    temporary directories, and never to your checkout, even when your checkout
@@ -150,7 +162,14 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
   stays for `/agy:resume` and `/agy:apply`, until the job is pruned (the
   newest 50 finished jobs are kept) or you run
   `python3 scripts/agy_companion.py cleanup`. Job state lives under
-  `$CLAUDE_PLUGIN_DATA/state`, or the system temporary directory.
+  `$CLAUDE_PLUGIN_DATA/state`, or the system temporary directory. The
+  session-start hook exports that directory to the session as
+  `AGY_COMPANION_STATE_DIR`, so commands and hooks share it.
+- **Jobs belong to the Claude session that started them.** `/agy:status`,
+  and `/agy:cancel`, `/agy:result`, `/agy:apply` and `--resume-last` without
+  a job id, see only this session's jobs. Pass a job id to reach another
+  session's job; `/agy:status --all` lists them. Run from a plain terminal,
+  where no session id is set, the commands see every job.
 - **`/agy:apply` checks for drift.** It refuses when a file the task changed
   has changed in your checkout since the job started, in content or mode.
   `--force` skips that check; git still refuses a patch that does not apply.

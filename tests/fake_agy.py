@@ -219,6 +219,10 @@ def main() -> int:
         time.sleep(3600)
         return 0
 
+    if scenario == "review-empty-structured":
+        result(conversation, "", structured_output={})
+        return 0
+
     if scenario == "review":
         review = {
             "verdict": "needs-attention",
