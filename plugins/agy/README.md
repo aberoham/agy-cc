@@ -17,9 +17,13 @@ works on its own copy of your repository, so agy never edits your checkout.
 - **git**, and `python3` 3.9 or later. The macOS system Python from the
   Command Line Tools is enough; the plugin needs no packages.
 - **Docker or Colima, and the agy image**, for container isolation. Build the
-  image from `containers/` in the source repository and sign in once with
+  image from `containers/` in the source repository with your own user ids
+  (`--build-arg UID=$(id -u) --build-arg GID=$(id -g)`) and sign in once with
   `containers/signin.sh`. Without them the plugin falls back to host mode,
-  described below.
+  described below. The image carries `git`, `curl`, `jq`, `python3` and `uv`,
+  so agy can run a Python repository's tests; add what your repositories
+  need to the Dockerfile. uv's cache lives in the container home, so it
+  persists across jobs.
 
 ## Install
 
@@ -91,6 +95,18 @@ it at all.
   container, as they would for a developer.
 - agy's own terminal sandbox is off inside the container (Docker blocks the
   user namespaces it needs); the container is the boundary.
+- Jobs run as your user id, and `/agy:setup` refuses an image built for a
+  different one, so files the image created and files on the bind mounts
+  have one owner without any ownership fix-up at start. Inside the container
+  git trusts the working copy and has an identity (`agy plugin`), so agy may
+  commit there; only the patch leaves.
+
+The container design follows Matt Pocock's
+[Sandcastle](https://github.com/mattpocock/sandcastle) (MIT): a bind-mounted
+working copy, the host user's ids baked into the image at build time with a
+pre-flight check, git trust and identity set inside the sandbox, caches in the
+sandbox home, and container removal on every exit path. No Sandcastle code is
+used, so `NOTICE` is unchanged.
 
 What the container does not change: agy still has the network, because it
 must reach Google, so a prompt injection in the repository can send out

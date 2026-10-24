@@ -75,7 +75,10 @@ def main() -> int:
         print("29.0.0")
         return 0
     if argv[:2] == ["image", "inspect"]:
-        print("sha256:fake")
+        if "{{.Config.User}}" in argv:
+            print(os.environ.get("FAKE_DOCKER_IMAGE_USER", f"{os.getuid()}:{os.getgid()}"))
+        else:
+            print("sha256:fake")
         return 0
     if argv[:1] == ["rm"]:
         return 0

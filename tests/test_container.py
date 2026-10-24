@@ -8,6 +8,7 @@ real container when Docker is reachable.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from agylib import container
@@ -45,6 +46,24 @@ def test_setup_reports_the_container_state(companion, contained):
     assert report["isolation"] == "container" and report["container_unavailable"] is None
 
 
+def test_an_image_built_for_another_user_is_refused_with_the_rebuild_command(contained):
+    other = f"{os.getuid() + 1}:{os.getgid() + 1}"
+    proc = contained.run(
+        "review", "--isolation", "container", scenario="review", check=False, FAKE_DOCKER_IMAGE_USER=other
+    )
+    assert proc.returncode == 2
+    assert f"built for user {other}" in proc.stderr and "--build-arg UID=$(id -u)" in proc.stderr
+    report = json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER=other).stdout)
+    assert report["image_user_matches"] is False and report["isolation"] == "host"
+    assert f"built for user {other}" in report["container_unavailable"]
+    # A named user cannot be checked and passes; a failed inspection does not.
+    assert json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER="agent").stdout)["image_user_matches"]
+    from agylib import container
+
+    assert container.image_user_matches(None) is False
+    assert container.image_user_matches("") is True
+
+
 def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, repo):
     proc = contained.run("review", "--model", "low", scenario="review")
     assert "Verdict: needs-attention" in proc.stdout
@@ -69,6 +88,14 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     assert (job_mount / "agy.log").parent == job_mount
     assert run[run.index("--log-file") + 1] == str(job_mount / "agy.log")
     assert "--init" in options and f"--env=HOME={home}" in options
+    env = dict(o[len("--env=") :].split("=", 1) for o in options if o.startswith("--env="))
+    keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
+    assert keys == {
+        "safe.directory": "*",
+        "user.name": "agy plugin",
+        "user.email": "agy-plugin@localhost",
+        "commit.gpgsign": "false",
+    }
     assert any(o.startswith("--name=agy-review-") for o in options)
     assert run[-1] == "--dangerously-skip-permissions"
     (call,) = contained.agy_calls()
