@@ -13,7 +13,7 @@ Development checks, matching CI:
 ```
 uvx ruff@0.16.6 check plugins tests
 uvx ruff@0.16.6 format --check plugins tests
-uvx --with pytest==9.1.1 ty@0.0.78 check plugins tests
+uvx --python 3.13 --with pytest==9.1.1 ty@0.0.78 check plugins tests
 uv run --no-project --python 3.9 --with 'pytest>=8.4,<10' pytest -q
 ```
 
