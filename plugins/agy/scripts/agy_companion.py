@@ -139,7 +139,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if reason:
         lines.append(f"Container mode is not available: {reason}.")
     else:
-        lines.append(f"Container: {report['image']} with sign-in under {report['agy_home']}")
+        lines.append(f"Container: {report['image']} with sign-in under {report['signin_home']}")
     lines += [f"Problem: {p}" for p in report["problems"]] or ["Ready."]
     print("\n".join(lines))
     return 0

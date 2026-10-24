@@ -71,23 +71,25 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     assert job["isolation"] == "container" and job["os_sandbox"] is False
     worktree = Path(job["worktree"])
     state = Path(contained.env["AGY_COMPANION_STATE_DIR"])
-    home = Path(contained.env["AGY_CONTAINER_HOME"])
+    signin = Path(contained.env["AGY_CONTAINER_HOME"])
     job_mount = worktree.parent.parent / "jobs" / job["id"] / "container"
     probe, run = contained.docker_runs()
-    assert "touch" in probe and str(state) in " ".join(probe) and str(home) in " ".join(probe)
+    assert "touch" in probe and str(state) in " ".join(probe)
     options = _run_options(run)
     volumes = [o[len("--volume=") :] for o in options if o.startswith("--volume=")]
-    # Exactly these, and nothing else: the job record and result stay outside.
+    # Exactly these, and nothing else: the job record, the result and the
+    # sign-in home stay outside.
     assert volumes == [
         f"{worktree}:{worktree}:ro",  # a review never edits the copy
         f"{job_mount}:{job_mount}",
-        f"{home}:{home}",
         f"{job['plugin_root']}:{job['plugin_root']}:ro",
     ]
-    assert not any(str(repo) in v for v in volumes)
-    assert (job_mount / "agy.log").parent == job_mount
+    assert not any(str(repo) in v or str(signin) in v for v in volumes)
     assert run[run.index("--log-file") + 1] == str(job_mount / "agy.log")
-    assert "--init" in options and f"--env=HOME={home}" in options
+    assert "--init" in options and f"--env=HOME={job_mount / 'home'}" in options
+    seeded = job_mount / "home" / ".gemini" / "antigravity-cli"
+    assert (seeded / "antigravity-oauth-token").read_text() == "{}"
+    assert (seeded / "settings.json").read_text() == '{"enableTerminalSandbox": false}\n'
     env = dict(o[len("--env=") :].split("=", 1) for o in options if o.startswith("--env="))
     keys = {env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"] for i in range(int(env["GIT_CONFIG_COUNT"]))}
     assert keys == {
@@ -174,6 +176,27 @@ def test_container_task_resumes_in_the_same_copy_and_conversation(contained, rep
     assert f"--volume={worktree}:{worktree}:ro" in runs[2]  # the read-only round does not
 
 
+def test_each_round_starts_from_a_fresh_home(contained, repo):
+    contained.run("task", "fix the bug", scenario="container")
+    job = contained.job()
+    home = Path(job["worktree"]).parent.parent / "jobs" / job["id"] / "container" / "home"
+    settings = home / ".gemini" / "antigravity-cli" / "settings.json"
+    assert settings.is_file()
+    settings.write_text('{"hooks": "planted by a job"}')  # what a hostile round could leave
+    (home / ".cache" / "uv").mkdir(parents=True)
+    contained.run("task", "--resume-last", "carry on", scenario="container")
+    assert settings.read_text() == '{"enableTerminalSandbox": false}\n'
+    assert not (home / ".cache").exists()
+
+
+def test_plans_are_read_from_the_job_home(contained):
+    proc = contained.run("plan", "add a median function", scenario="plan")
+    assert "1. Do the thing." in proc.stdout
+    job = contained.job()
+    assert job["status"] == "completed"
+    assert "/container/home/.gemini/antigravity-cli/brain/" in proc.stdout
+
+
 def test_cancel_removes_the_container(contained):
     contained.run("task", "--background", "--model", "high", "--stall-seconds", "600", "do it", scenario="stall")
     job = contained.wait_for(lambda j: j["status"] == "running" and j.get("container"))
@@ -201,6 +224,8 @@ def test_wrap_puts_every_mount_at_its_host_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     (tmp_path / "docker").write_text("")
     (tmp_path / "docker").chmod(0o755)
+    (tmp_path / "container-home" / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    container.seed_home(tmp_path / "job")
     mounts = container.Mounts(tmp_path / "wt", tmp_path / "job", tmp_path / "plugin", [tmp_path / "docs"], True)
     command = container.wrap(["agy", "--model", "x", "--print="], name="agy-job-1", mounts=mounts)
     assert command[0] == str(tmp_path / "docker")
@@ -208,6 +233,8 @@ def test_wrap_puts_every_mount_at_its_host_path(tmp_path, monkeypatch):
     assert f"--volume={tmp_path / 'docs'}:{tmp_path / 'docs'}:ro" in command
     assert f"--volume={tmp_path / 'job' / 'container'}:{tmp_path / 'job' / 'container'}" in command
     assert not any(o == f"--volume={tmp_path / 'job'}:{tmp_path / 'job'}" for o in command)
+    assert not any(str(tmp_path / "container-home") in o for o in command)
+    assert f"--env=HOME={tmp_path / 'job' / 'container' / 'home'}" in command
     assert command[-4:] == ["--model", "x", "--print=", "--dangerously-skip-permissions"]
     assert "agy" not in command[command.index(container.DEFAULT_IMAGE) + 1 :]
 
