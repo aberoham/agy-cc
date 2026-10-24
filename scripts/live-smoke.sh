@@ -33,7 +33,11 @@ done
 
 # The script works only in the throwaway repository it creates; inherited
 # variables that point git at another repository must not apply.
+# Injected and global git configuration (hooks, helpers) is ignored too, and
+# Python writes no bytecode into the plugin directory.
 unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY GIT_CEILING_DIRECTORIES
+unset GIT_CONFIG GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_EXTERNAL_DIFF GIT_EXEC_PATH
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null PYTHONDONTWRITEBYTECODE=1
 
 here="$(cd "$(dirname "$0")/.." && pwd)"
 plugin="${here}/plugins/agy"
@@ -109,20 +113,27 @@ run_confined() {
     (cd "${dir}" && PYTHONDONTWRITEBYTECODE=1 /usr/bin/sandbox-exec -p "${profile}" "$@" 2>&1)
 }
 
-mkdir -p "${repo}"
-git -C "${repo}" init -q -b main
-printf 'def average(values):\n    return sum(values) / len(values)\n' >"${repo}/stats.py"
-git -C "${repo}" add stats.py
-git -C "${repo}" -c user.name=smoke -c user.email=smoke@localhost commit -qm init
-printf 'def average(values):\n    total = 0\n    for i in range(1, len(values)):\n        total += values[i]\n    return total / len(values)\n' >"${repo}/stats.py"
-checkout_state() {
-    git -C "${repo}" status --porcelain
-    git -C "${repo}" diff
+sgit() { git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "${repo}" "$@"; }
+prepare() {
+    mkdir -p "${repo}" \
+        && sgit init -q -b main \
+        && printf 'def average(values):\n    return sum(values) / len(values)\n' >"${repo}/stats.py" \
+        && sgit add stats.py \
+        && sgit -c user.name=smoke -c user.email=smoke@localhost commit -qm init \
+        && printf 'def average(values):\n    total = 0\n    for i in range(1, len(values)):\n        total += values[i]\n    return total / len(values)\n' >"${repo}/stats.py"
 }
-before="$(checkout_state)"
+checkout_state() {
+    sgit status --porcelain
+    sgit diff --no-ext-diff --no-textconv
+}
 
 log "agy plugin live smoke test, $(date -u +%Y-%m-%dT%H:%M:%SZ), model ${model}"
 log "Work directory: ${work}"
+if ! prepare; then
+    fail prepare "could not create the throwaway repository in ${repo}"
+    exit 1
+fi
+before="$(checkout_state)"
 
 # setup
 start=${SECONDS}
@@ -166,8 +177,10 @@ start=${SECONDS}
 rc=0
 out="$(companion plan --model "${model}" --wait-seconds 280 add a median function to stats.py)" || rc=$?
 job="$(newest_job plan)"
-if [[ "${out}" == *"Plan file:"* ]] && [[ "$(checkout_state)" == "${before}" ]]; then
-    pass "plan ($(field "${job}" status))" $((SECONDS - start))
+plan_status="$(field "${job}" status)"
+if ((rc == 0)) && [[ "${plan_status}" == "completed" || "${plan_status}" == "needs-approval" ]] \
+    && [[ "${out}" == *"Plan file:"* ]] && [[ "$(checkout_state)" == "${before}" ]]; then
+    pass "plan (${plan_status})" $((SECONDS - start))
 elif ((rc == 0)) && [[ "$(field "${job}" status)" == "needs-approval" ]] && [[ "$(checkout_state)" == "${before}" ]]; then
     warn plan "agy stopped to ask for commands before writing a plan: $(field "${job}" queued_commands)"
 else
@@ -182,7 +195,7 @@ job="$(newest_job task)"
 task_id="$(field "${job}" id)"
 status="$(field "${job}" status)"
 worktree="$(field "${job}" worktree)"
-if [[ "${status}" == "completed" || "${status}" == "needs-approval" ]] \
+if ((rc == 0)) && [[ "${status}" == "completed" || "${status}" == "needs-approval" ]] \
     && [[ "$(checkout_state)" == "${before}" ]] \
     && [[ -n "${worktree}" && -d "${worktree}" ]] \
     && ! cmp -s "${repo}/stats.py" "${worktree}/stats.py"; then
@@ -198,14 +211,19 @@ if [[ "${status}" == "needs-approval" ]]; then
         results="${work}/results.txt"
         crc=0
         output="$(run_confined "${worktree}" python3 -c 'import stats; print(stats.average([1, 2, 3]))')" || crc=$?
-        printf '$ %s\n%s\nexit status: %s\n' "${expected}" "${output}" "${crc}" >"${results}"
-        rc=0
-        out="$(companion resume "${task_id}" "${results}" --wait-seconds 280)" || rc=$?
-        status="$(field "$(newest_job task)" status)"
-        if ((crc == 0)) && ((rc == 0)) && [[ "${status}" == "completed" ]]; then
-            pass resume $((SECONDS - start))
+        if ((crc == 125)); then
+            log "SKIP  resume: ${output}"
+        elif ! printf '$ %s\n%s\nexit status: %s\n' "${expected}" "${output}" "${crc}" >"${results}"; then
+            fail resume "could not write ${results}"
         else
-            fail resume "command exit ${crc}, companion exit ${rc}, job ${status}: ${out:0:300}"
+            rc=0
+            out="$(companion resume "${task_id}" "${results}" --wait-seconds 280)" || rc=$?
+            status="$(field "$(newest_job task)" status)"
+            if ((crc == 0)) && ((rc == 0)) && [[ "${status}" == "completed" ]]; then
+                pass resume $((SECONDS - start))
+            else
+                fail resume "command exit ${crc}, companion exit ${rc}, job ${status}: ${out:0:300}"
+            fi
         fi
     else
         fail resume "agy queued something other than the requested command: $(field "${job}" queued_commands)"
@@ -276,25 +294,38 @@ if ${with_claude}; then
     if [[ -z "${claude_bin}" ]]; then
         fail claude "claude not found; set CLAUDE_BIN"
     else
-        for command in "/agy:setup" "/agy:review --wait --model ${model}"; do
-            start=${SECONDS}
-            rc=0
-            out="$(cd "${repo}" && "${claude_bin}" -p "${command}" --plugin-dir "${plugin}" </dev/null 2>&1)" || rc=$?
-            if ((rc == 0)) && [[ -n "${out}" ]]; then
-                pass "claude ${command}" $((SECONDS - start))
-            else
-                fail "claude ${command}" "exit ${rc}: ${out:0:300}"
-            fi
-        done
+        version="$(field "$(companion setup --json)" agy_version)"
+        start=${SECONDS}
+        rc=0
+        out="$(cd "${repo}" && "${claude_bin}" -p "/agy:setup" --plugin-dir "${plugin}" </dev/null 2>&1)" || rc=$?
+        # The setup command's output names the agy version; a refusal would not.
+        if ((rc == 0)) && [[ -n "${version}" && "${out}" == *"${version}"* ]]; then
+            pass "claude /agy:setup" $((SECONDS - start))
+        else
+            fail "claude /agy:setup" "exit ${rc}: ${out:0:300}"
+        fi
+        reviews_before="$(ls -d "${AGY_COMPANION_STATE_DIR}"/*/jobs/review-* 2>/dev/null | wc -l | tr -d ' ')"
+        start=${SECONDS}
+        rc=0
+        out="$(cd "${repo}" && "${claude_bin}" -p "/agy:review --wait --model ${model}" --plugin-dir "${plugin}" </dev/null 2>&1)" || rc=$?
+        reviews_after="$(ls -d "${AGY_COMPANION_STATE_DIR}"/*/jobs/review-* 2>/dev/null | wc -l | tr -d ' ')"
+        # Claude must actually have started a review job that completed.
+        if ((rc == 0)) && ((reviews_after > reviews_before)) \
+            && [[ "$(field "$(newest_job review)" status)" == "completed" ]] \
+            && [[ "$(checkout_state)" == "${before}" ]]; then
+            pass "claude /agy:review" $((SECONDS - start))
+        else
+            fail "claude /agy:review" "exit ${rc}, review jobs ${reviews_before} -> ${reviews_after}: ${out:0:300}"
+        fi
     fi
 fi
 
 log ""
 log "Approval rounds for the task job:"
 if table="$(companion status "${task_id}")"; then
-    printf '%s\n' "${table}" | sed -n '/^| Round/,/^$/p' | tee -a "${report}"
+    printf '%s\n' "${table}" | sed -n '/^| Round/,/^$/p' | tee -a "${report}" || true
 else
-    log "(status unavailable)"
+    fail status "could not read the task's status"
 fi
 log "Report: ${report}"
 if ((failures > 0)); then
