@@ -1,14 +1,19 @@
 """Run agy inside a Linux container, with the container as the isolation boundary.
 
 The container sees the job's working copy, one subdirectory of the job's
-state directory (for agy's log and the exported patch), the plugin's own
-files (read-only) and a separate agy home that holds the container sign-in.
-Each is mounted at its host path, so paths in agy's output, in its log and
-in the plan artifact mean the same thing on both sides and nothing has to be
-translated. Nothing else from the host is mounted, so a prompt-injected
-"read ~/.aws/credentials" finds no such file. The job record, the baseline
-snapshot and the result stay outside the mount: the host trusts them, so
-nothing inside the container may write them.
+state directory (for agy's log, the exported patch and the job's own home)
+and the plugin's own files (read-only). Each is mounted at its host path, so
+paths in agy's output, in its log and in the plan artifact mean the same
+thing on both sides and nothing has to be translated. Nothing else from the
+host is mounted, so a prompt-injected "read ~/.aws/credentials" finds no
+such file. The job record, the baseline snapshot and the result stay outside
+the mount: the host trusts them, so nothing inside the container may write
+them.
+
+The job's home is seeded at the start of every round from the sign-in home
+(the token and settings that containers/signin.sh wrote) and is never
+shared: one job cannot leave a setting, a hook or a cached package behind
+for the next, whatever repository it was reviewing.
 
 Inside the container agy runs with --dangerously-skip-permissions: it may
 run any command and edit any file it can reach, and what it can reach is the
@@ -65,13 +70,17 @@ def image_name() -> str:
     return os.environ.get(IMAGE_ENV) or DEFAULT_IMAGE
 
 
-def agy_home() -> Path:
-    """The container's HOME, where agy keeps the container sign-in, its settings and its brain.
+SIGNIN_FILES = ("antigravity-oauth-token", "settings.json")
+DEFAULT_SETTINGS = '{"enableTerminalSandbox": false}\n'
+
+
+def signin_home() -> Path:
+    """Where containers/signin.sh leaves the container sign-in and settings.
 
     One per user, beside the host's own ~/.gemini rather than inside a state
     directory, so every state directory (per plugin install, or per test)
-    shares the one sign-in. Under the home directory, which a Docker virtual
-    machine on macOS shares by default.
+    shares the one sign-in. It is never mounted into a job; each job gets a
+    copy.
     """
     explicit = os.environ.get(HOME_ENV)
     if explicit:
@@ -80,8 +89,37 @@ def agy_home() -> Path:
 
 
 def container_token_present() -> bool:
-    token = agy_home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
+    token = signin_home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
     return token.is_file() and token.stat().st_size > 0
+
+
+def job_home(job_dir: Path) -> Path:
+    """The job's own HOME inside its mounted subdirectory."""
+    return job_mount(job_dir) / "home"
+
+
+def seed_home(job_dir: Path) -> Path:
+    """Give the job a fresh home holding only the sign-in and settings, and return it.
+
+    Anything an earlier round left there (agy's brain, caches, edited
+    settings) is removed first, so each round starts from what the user
+    signed in with. The refresh token in the copy keeps working: refreshing
+    does not rotate it, so copies refreshed independently stay valid until
+    the pool session ends.
+    """
+    home = job_home(job_dir)
+    if home.exists():
+        shutil.rmtree(home)
+    target = home / ".gemini" / "antigravity-cli"
+    target.mkdir(parents=True)
+    source = signin_home() / ".gemini" / "antigravity-cli"
+    for name in SIGNIN_FILES:
+        if (source / name).is_file():
+            shutil.copyfile(source / name, target / name)
+            os.chmod(target / name, 0o600)
+    if not (target / "settings.json").is_file():
+        (target / "settings.json").write_text(DEFAULT_SETTINGS, encoding="utf-8")
+    return home
 
 
 def _docker(*args: str, timeout: float = DOCKER_TIMEOUT) -> subprocess.CompletedProcess | None:
@@ -133,18 +171,18 @@ def job_mount(job_dir: Path) -> Path:
 
 
 def state_mountable() -> bool:
-    """Whether the container can write into the plugin's state directory and the container home.
+    """Whether the container can write into the plugin's state directory.
 
     A Docker virtual machine on macOS shares only some host directories
     (Colima shares the home directory, not /var/folders), so a state root in
     the system temporary directory cannot hold a job. The probe touches a
-    file in each directory from inside the container. The names are fresh
+    file in the state root from inside the container. The name is fresh
     each time: the virtual machine's shared filesystem caches a file the host
     has since deleted, and touching that name again creates nothing the host
     can see.
     """
     probes = []
-    for directory in (state_root(), agy_home()):
+    for directory in (state_root(),):
         directory.mkdir(parents=True, exist_ok=True)
         probes.append(directory / (WORKSPACE_PROBE + secrets.token_hex(4)))
     proc = _docker(
@@ -177,7 +215,7 @@ def report() -> dict[str, object]:
         "image_user": user,
         "image_user_matches": present and image_user_matches(user),
         "state_mountable": present and state_mountable(),
-        "agy_home": str(agy_home()),
+        "signin_home": str(signin_home()),
         "container_signed_in": container_token_present(),
     }
 
@@ -204,7 +242,7 @@ def unavailable_reason(status: dict[str, object] | None = None) -> str | None:
             "set AGY_COMPANION_STATE_DIR to a directory under your home"
         )
     if not status["container_signed_in"]:
-        return f"agy is not signed in for containers; run containers/signin.sh (it writes to {agy_home()})"
+        return f"agy is not signed in for containers; run containers/signin.sh (it writes to {signin_home()})"
     return None
 
 
@@ -223,15 +261,15 @@ class Mounts:
         self.plugin_root = plugin_root
         self.read_dirs = read_dirs
         self.writable = writable
-        self.home = agy_home()
+        self.home = job_home(job_dir)
 
     def prefix(self, name: str) -> list[str]:
         """docker run options: identity, environment and the volumes."""
         binary = docker_bin()
         if not binary:
             raise RuntimeError("docker is not installed or not on PATH")
-        (self.home / ".gemini").mkdir(parents=True, exist_ok=True)
-        self.job_mount.mkdir(parents=True, exist_ok=True)
+        if not self.home.is_dir():
+            raise RuntimeError(f"the job's home {self.home} has not been seeded")
         command = [
             str(binary),
             "run",
@@ -244,7 +282,6 @@ class Mounts:
             *GIT_ENV,
             f"--volume={self.worktree}:{self.worktree}" + ("" if self.writable else ":ro"),
             f"--volume={self.job_mount}:{self.job_mount}",
-            f"--volume={self.home}:{self.home}",
             f"--volume={self.plugin_root}:{self.plugin_root}:ro",
         ]
         for directory in self.read_dirs:

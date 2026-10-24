@@ -194,6 +194,15 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   round with no queued commands. Earlier the same request had ended with
   "No module named pytest".
 
+- Per-job home (24 October 2026): a side review pointed out that every
+  container job mounted the same writable home, so a hostile branch could
+  leave a setting, a hook or a cached package for every later job on any
+  repository. Sandcastle avoids this by construction: its HOME is image-local
+  and dies with the container, credentials arrive as environment variables,
+  and caches are an explicit opt-in mount shown read-only. Jobs now get a
+  home seeded from the sign-in home at the start of every round, and the
+  sign-in home is never mounted.
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)

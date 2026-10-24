@@ -284,7 +284,7 @@ class JobRunner:
 
     def _plan_root(self) -> str:
         """Where a plan artifact may be read from: agy's brain directory for the job's home."""
-        home = container.agy_home() if self.job.get("isolation") == "container" else Path.home()
+        home = container.job_home(self.dir) if self.job.get("isolation") == "container" else Path.home()
         return str(home / ".gemini" / "antigravity-cli" / "brain") + os.sep
 
     def _stop_container(self) -> None:
@@ -335,6 +335,8 @@ class JobRunner:
         started = time.monotonic()
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
         usage_total: dict[str, int] = {}
+        if self.job.get("isolation") == "container":
+            container.seed_home(self.dir)  # a fresh home for this round, from the sign-in
 
         while True:
             self.step_usage = {}
