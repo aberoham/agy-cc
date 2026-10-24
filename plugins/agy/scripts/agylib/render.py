@@ -29,17 +29,19 @@ def _stall_count(job: dict[str, Any]) -> int:
 def status_table(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return "No agy jobs for this repository."
-    header = "| Job | Kind | Status | Phase | Model | Elapsed | Rounds | Stalls | Queued commands |\n"
-    header += "|---|---|---|---|---|---|---|---|---|\n"
+    header = "| Job | Kind | Status | Phase | Model | Isolation | Elapsed | Rounds | Stalls | Queued commands |\n"
+    header += "|---|---|---|---|---|---|---|---|---|---|\n"
     rows = []
     for job in jobs:
         rows.append(
-            "| {id} | {kind} | {status} | {phase} | {model} | {elapsed} | {rounds} | {stalls} | {queued} |".format(
+            "| {id} | {kind} | {status} | {phase} | {model} | {isolation} | {elapsed} | {rounds} | {stalls} "
+            "| {queued} |".format(
                 id=job.get("id"),
                 kind=job.get("kind"),
                 status=job.get("status"),
                 phase=str(job.get("phase") or "").replace("|", "/"),
                 model=job.get("model"),
+                isolation=job.get("isolation") or "host",
                 elapsed=elapsed(job),
                 rounds=len(job.get("rounds") or []),
                 stalls=_stall_count(job),
@@ -74,6 +76,7 @@ def job_detail(job: dict[str, Any]) -> str:
         f"Kind: {job.get('kind')}",
         f"Status: {job.get('status')} ({job.get('phase')})",
         f"Model: {job.get('model')}",
+        f"Isolation: {job.get('isolation') or 'host'}",
         f"Elapsed: {elapsed(job)}",
         f"Conversation: {job.get('conversation_id') or '-'}",
         f"Working copy: {job.get('worktree')}",

@@ -123,6 +123,38 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   plugin's data directory; the job state then lands there. Harmless, but
   `/agy:status` from a plain terminal will not see those jobs.
 
+## Container mode, verified live (24 October 2026)
+
+- Colima (virtiofs) shares the home directory and not `/var/folders`: a
+  `touch` through a bind mount of a `mktemp -d` directory failed with
+  "Permission denied", and the same under `~/.claude` worked. So the state
+  root must be under the home directory for container jobs; the companion
+  probes this with a `touch` from inside the container.
+- With `--user 501:20` the files the host created appear owned by `501 20`
+  inside the container, but git in the container still refused the working
+  copy as "dubious ownership" until `safe.directory=*` was passed through
+  `GIT_CONFIG_*` environment variables.
+- Live runs on `gemini-4-argon-low` with `--isolation container`, the image
+  from `containers/Dockerfile` and the sign-in home seeded by copying the
+  host's `antigravity-oauth-token` plus a `settings.json` with the host's
+  `gcp` block and `enableTerminalSandbox: false`: task 45 s (edited
+  `stats.py`, ran the requested `python3 -c` itself, patch exported inside
+  the container and `apply --check` passed on the host); review 19 s with
+  the planted bug found; plan 1 m 57 s with the plan read from the brain
+  directory in the container home. No container was left after any run.
+- The task was asked to list `~/.aws`, `~/.ssh` and the host's `~/.gemini`;
+  the model declined on policy grounds and the Gemini API also returned a
+  content-safety error for that turn, so the job ended `failed` while its
+  patch was still exported. The fake-agy test inside a real container is what
+  shows those paths are absent.
+- In plan mode inside the container agy used its research subagent; the
+  host policy blocked subagents, the container does not.
+- In-container sign-in with `containers/signin.sh` is not yet tested (it
+  needs a terminal). `AGY_ADC_AUTH` is untested too: the host's Application
+  Default Credentials file is an `authorized_user` credential with a refresh
+  token, not a workforce federation credential, so the seat-or-pay-as-you-go
+  question for ADC stays open.
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)
@@ -136,7 +168,7 @@ needs Python 3.10+ and packages (pydantic, google-genai, protobuf), so uv.
 Open question for Abe: is Vertex AI billing through ADC acceptable for this
 plugin, instead of the Enterprise seat?
 
-## Containers (research of 24 October 2026; nothing run yet)
+## Containers (research of 24 October 2026, before the live runs above)
 
 - Linux builds exist: `https://antigravity.google/cli/install.sh` installs
   `linux_amd64`, `linux_arm64` and musl variants from a manifest with a

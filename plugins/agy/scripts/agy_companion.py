@@ -22,7 +22,7 @@ SCRIPTS = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
 
-from agylib import agybin, gitctx, render, sandbox  # noqa: E402
+from agylib import agybin, container, gitctx, render, sandbox  # noqa: E402
 from agylib.runner import JobRunner, terminate_job_processes  # noqa: E402
 from agylib.state import (  # noqa: E402
     ACTIVE_STATUSES,
@@ -42,6 +42,23 @@ from agylib.state import (  # noqa: E402
 
 KIND_MODES = {"review": None, "adversarial-review": None, "plan": "plan", "task": "accept-edits"}
 DEFAULT_WAIT_SECONDS = 100  # stays under Claude Code's default two-minute Bash timeout
+ISOLATION_CHOICES = ("auto", "container", "host")
+HOST_SHELL_RULE = (
+    "Shell commands that are not read-only are not run: they are queued for the colleague's "
+    "assistant, which may run them and send you the output in a later turn."
+)
+CONTAINER_SHELL_RULE = (
+    "You are inside a container that holds only this working copy, so run the commands you need, including tests."
+)
+HOST_REVIEW_GUIDANCE = (
+    "Use the repository context below as primary evidence. Do not use shell commands in this "
+    "job; most are blocked. Use your file tools (read, list, find and search files) to inspect "
+    "the repository."
+)
+CONTAINER_REVIEW_GUIDANCE = (
+    "Use the repository context below as primary evidence, and inspect the working copy with "
+    "your file tools or read-only shell commands. Do not change files."
+)
 
 
 class UsageError(Exception):
@@ -86,6 +103,9 @@ def setup_report() -> dict[str, Any]:
         "python": sys.version.split()[0],
         "default_model": agybin.DEFAULT_MODEL,
     }
+    report.update(container.report())
+    report["container_unavailable"] = container.unavailable_reason(report)
+    report["isolation"] = "host" if report["container_unavailable"] else "container"
     problems = []
     if not binary:
         problems.append("agy is not installed or not on PATH. Install it, or set AGY_BIN to its path.")
@@ -110,6 +130,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
     lines.append(f"Google Cloud project: {report['gcp_project'] or '-'} ({report['gcp_location'] or '-'})")
     lines.append(f"macOS write sandbox: {'available' if report['os_sandbox'] else 'not available'}")
     lines.append(f"Default model: {report['default_model']}")
+    lines.append(f"Isolation: {report['isolation']}")
+    reason = report["container_unavailable"]
+    if reason:
+        lines.append(f"Container mode is not available: {reason}.")
+    else:
+        lines.append(f"Container: {report['image']} with sign-in under {report['agy_home']}")
     lines += [f"Problem: {p}" for p in report["problems"]] or ["Ready."]
     print("\n".join(lines))
     return 0
@@ -126,16 +152,10 @@ def start_job(
         raise UsageError("agy is not installed or not on PATH. Run /agy:setup.")
     root = gitctx.repo_root(os.getcwd())
     store = JobStore(root)
+    isolation = choose_isolation(args)
     job_id = new_job_id(kind)
     job_dir = store.jobs / job_id
     worktree = store.dir / "worktrees" / job_id
-    baseline = gitctx.create_worktree(root, worktree, hook_command(job_dir))
-    try:
-        git_admin = Path(gitctx.git(worktree, "rev-parse", "--absolute-git-dir").strip())
-    except Exception:
-        gitctx.remove_worktree(root, worktree)
-        raise
-    use_sandbox = sandbox.available() and not args.no_os_sandbox
     record: dict[str, Any] = {
         "id": job_id,
         "kind": kind,
@@ -145,12 +165,12 @@ def start_job(
         "mode": KIND_MODES[kind],
         "writable": writable,
         "worktree": str(worktree),
-        "baseline": baseline,
         "repo_root": str(root),
         "agy_bin": str(binary),
+        "plugin_root": str(PLUGIN_ROOT),
         "session_id": os.environ.get(SESSION_ID_ENV),
-        "os_sandbox": use_sandbox,
-        "writable_paths": [str(worktree), str(agybin.agy_home()), str(job_dir), str(git_admin)],
+        "isolation": isolation,
+        "os_sandbox": False,
         "json_schema": str(PLUGIN_ROOT / "schemas" / "review-output.schema.json")
         if kind in ("review", "adversarial-review")
         else None,
@@ -158,17 +178,55 @@ def start_job(
         "read_dirs": [str(Path(d).expanduser().resolve()) for d in (args.read_dir or [])],
         "generation": 1,
     }
+    if isolation == "container":
+        record["baseline"] = gitctx.create_copy(root, worktree)
+    else:
+        record["baseline"] = gitctx.create_worktree(root, worktree, hook_command(job_dir))
+        try:
+            git_admin = Path(gitctx.git(worktree, "rev-parse", "--absolute-git-dir").strip())
+        except Exception:
+            gitctx.remove_worktree(root, worktree)
+            raise
+        record["os_sandbox"] = sandbox.available() and not args.no_os_sandbox
+        record["writable_paths"] = [str(worktree), str(agybin.agy_home()), str(job_dir), str(git_admin)]
+    try:
+        tree = gitctx.baseline_tree(worktree, record["baseline"])
+    except Exception:
+        gitctx.remove_worktree(root, worktree)
+        raise
     if args.stall_seconds:
         record["stall_seconds"] = args.stall_seconds
     record.update(extra or {})
     if record["read_dirs"]:
         message += "\n\nYou may also read files in: " + ", ".join(record["read_dirs"]) + "\n"
     store.create(record)
-    write_json(job_dir / "policy.json", policy_for(record))
+    write_json(job_dir / "baseline-tree.json", tree)
+    if isolation == "host":
+        write_json(job_dir / "policy.json", policy_for(record))
     record_session_job(record["session_id"], root, job_id)
     (job_dir / "next-message.md").write_text(message, encoding="utf-8")
     spawn_worker(store, job_id)
     return wait_or_report(store, job_id, args)
+
+
+def choose_isolation(args: argparse.Namespace) -> str:
+    """Container when it is available, otherwise the host-side policy and sandbox.
+
+    The container check starts a container, so the answer is kept on args
+    for the rest of the command."""
+    chosen = getattr(args, "chosen_isolation", None)
+    if chosen:
+        return chosen
+    wanted = getattr(args, "isolation", None) or "auto"
+    if wanted == "host":
+        chosen = "host"
+    else:
+        reason = container.unavailable_reason()
+        if reason is not None and wanted == "container":
+            raise UsageError(f"container isolation is not available: {reason}.")
+        chosen = "host" if reason else "container"
+    args.chosen_isolation = chosen
+    return chosen
 
 
 def hook_command(job_dir: Path) -> str:
@@ -220,6 +278,7 @@ def wait_or_report(store: JobStore, job_id: str, args: argparse.Namespace) -> in
 
 def cmd_review(args: argparse.Namespace, kind: str = "review") -> int:
     root = gitctx.repo_root(os.getcwd())
+    in_container = choose_isolation(args) == "container"
     target = gitctx.resolve_target(root, args.base, args.scope)
     context = gitctx.collect_context(root, target)
     if not context["files"]:
@@ -232,11 +291,7 @@ def cmd_review(args: argparse.Namespace, kind: str = "review") -> int:
         TARGET_LABEL=target["label"],
         TARGET_SUMMARY=context["summary"],
         USER_FOCUS=focus,
-        REVIEW_COLLECTION_GUIDANCE=(
-            "Use the repository context below as primary evidence. Do not use shell commands in this "
-            "job; most are blocked. Use your file tools (read, list, find and search files) to inspect "
-            "the repository."
-        ),
+        REVIEW_COLLECTION_GUIDANCE=CONTAINER_REVIEW_GUIDANCE if in_container else HOST_REVIEW_GUIDANCE,
         REVIEW_INPUT=context["content"],
     )
     return start_job(args, kind, message, writable=False, extra={"target": target})
@@ -265,7 +320,9 @@ def cmd_task(args: argparse.Namespace) -> int:
         if not previous:
             raise UsageError("No earlier agy task from this session to resume in this repository.")
         return continue_job(store, previous, request, "follow-up", args, read_only=args.read_only)
-    return start_job(args, "task", template("task.md", USER_REQUEST=request), writable=not args.read_only)
+    shell_rule = CONTAINER_SHELL_RULE if choose_isolation(args) == "container" else HOST_SHELL_RULE
+    message = template("task.md", USER_REQUEST=request, SHELL_RULE=shell_rule)
+    return start_job(args, "task", message, writable=not args.read_only)
 
 
 def continue_job(
@@ -310,13 +367,14 @@ def continue_job(
 
     record = store.update(job_id, mutate)
     job_dir = store.job_dir(job_id)
-    try:
-        gitctx.install_hooks(Path(record["worktree"]), hook_command(job_dir))  # .agents holds only the hook again
-    except Exception as exc:
-        error = f"could not prepare the working copy: {exc}"
-        store.update(job_id, lambda r: r.update({"status": "failed", "phase": "failed", "error": error}))
-        raise
-    write_json(job_dir / "policy.json", policy_for(record))
+    if record.get("isolation") != "container":
+        try:
+            gitctx.install_hooks(Path(record["worktree"]), hook_command(job_dir))  # .agents holds only the hook again
+        except Exception as exc:
+            error = f"could not prepare the working copy: {exc}"
+            store.update(job_id, lambda r: r.update({"status": "failed", "phase": "failed", "error": error}))
+            raise
+        write_json(job_dir / "policy.json", policy_for(record))
     (job_dir / "next-message.md").write_text(message, encoding="utf-8")
     spawn_worker(store, job_id)
     return wait_or_report(store, job_id, args)
@@ -489,7 +547,8 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 0
     stored = read_json(job_dir / "result.json", {}) or {}
     root = Path(job["repo_root"])
-    moved = gitctx.baseline_mismatches(root, Path(job["worktree"]), job["baseline"], stored.get("changed_paths") or [])
+    tree = read_json(job_dir / "baseline-tree.json", {}) or {}
+    moved = gitctx.baseline_mismatches(root, tree, stored.get("changed_paths") or [])
     if moved and not args.force:
         listed = "\n".join(f"- {path}" for path in moved)
         raise UsageError(
@@ -520,6 +579,15 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             gitctx.remove_worktree(job["repo_root"], worktree)
             removed.append(job["id"])
     print(f"Removed {len(removed)} job working cop{'y' if len(removed) == 1 else 'ies'}.")
+    return 0
+
+
+def cmd_export(args: argparse.Namespace) -> int:
+    """Write a container job's patch and file list. Runs inside the container."""
+    out = Path(args.out_dir)
+    changes = gitctx.export_changes(Path(args.worktree), args.baseline, gitctx.CONTAINER_EXPORT_EXCLUDES)
+    (out / "changes.patch").write_bytes(changes["patch"])
+    write_json(out / "changes.json", {"name_status": changes["name_status"], "paths": changes["paths"]})
     return 0
 
 
@@ -573,7 +641,13 @@ def add_run_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--wait", action="store_true", help="wait for the result (the default)")
     parser.add_argument("--wait-seconds", type=int, help=argparse.SUPPRESS)
     parser.add_argument("--stall-seconds", type=float, help=argparse.SUPPRESS)
-    parser.add_argument("--no-os-sandbox", action="store_true", help="do not wrap agy in sandbox-exec")
+    parser.add_argument("--no-os-sandbox", action="store_true", help="host mode: do not wrap agy in sandbox-exec")
+    parser.add_argument(
+        "--isolation",
+        choices=ISOLATION_CHOICES,
+        default="auto",
+        help="container when available (the default), or host for the hook policy and sandbox-exec",
+    )
     parser.add_argument(
         "--read-dir", action="append", help="another directory agy may read (repeatable); reads are otherwise confined"
     )
@@ -635,6 +709,12 @@ def build_parser() -> argparse.ArgumentParser:
     worker = sub.add_parser("_worker")
     worker.add_argument("job")
     worker.set_defaults(func=cmd_worker)
+
+    export = sub.add_parser("_export")
+    export.add_argument("worktree")
+    export.add_argument("baseline")
+    export.add_argument("out_dir")
+    export.set_defaults(func=cmd_export)
 
     sub.add_parser("session-start").set_defaults(func=cmd_session_start)
     sub.add_parser("session-end").set_defaults(func=cmd_session_end)

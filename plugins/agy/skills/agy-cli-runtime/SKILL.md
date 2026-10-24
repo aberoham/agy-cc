@@ -19,5 +19,5 @@ Helper: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py" task [--backgr
 ## Gotchas
 
 - Never call `agy` directly. In some shells `agy` is a shell function that the Bash tool cannot see, and the companion is what adds the worktree, the tool policy hook, the write sandbox and stall recovery.
-- Never pass `--dangerously-skip-permissions`; the companion refuses it.
-- Shell commands that are not read-only are not run by agy: the job ends as `needs-approval` with the commands listed. That is expected, not a failure.
+- Never pass `--dangerously-skip-permissions`. Only the companion's container backend adds it, inside the container; in host mode the companion refuses it.
+- In host mode, shell commands that are not read-only are not run by agy: the job ends as `needs-approval` with the commands listed. That is expected, not a failure. In container mode agy runs its own commands.

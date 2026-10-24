@@ -19,7 +19,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from . import agybin, gitctx, sandbox
+from . import agybin, container, gitctx, sandbox
 from .policy import WRITE_TOOLS
 from .state import JobStore, now_iso, read_json, write_json
 
@@ -88,7 +88,10 @@ def run_turn(
     env: dict[str, str] | None = None,
     tool_stall_seconds: float = DEFAULT_TOOL_STALL_SECONDS,
     on_start: Callable[[int], None] | None = None,
+    on_stop: Callable[[], None] | None = None,
 ) -> TurnOutcome:
+    """Run one agy turn and follow it. on_stop runs after agy's process group
+    is stopped, for whatever the process group does not cover (a container)."""
     log_offset = log_path.stat().st_size if log_path.exists() else 0
     with open(stderr_path, "ab") as stderr:
         proc = subprocess.Popen(
@@ -108,6 +111,8 @@ def run_turn(
         )
     finally:
         _stop(proc)
+        if on_stop:
+            on_stop()
 
 
 def _follow(
@@ -252,7 +257,17 @@ class JobRunner:
     # Turn loop --------------------------------------------------------------
 
     def _record_agy_pid(self, pid: int) -> None:
-        self.store.update(self.job_id, lambda r: r.update({"agy_pid": pid}))
+        self.store.update(self.job_id, lambda r: r.update({"agy_pid": pid, "container": self._container_name()}))
+
+    def _container_name(self) -> str | None:
+        if self.job.get("isolation") != "container":
+            return None
+        return container.container_name(self.job_id, int(self.job.get("generation") or 1))
+
+    def _stop_container(self) -> None:
+        name = self._container_name()
+        if name:
+            container.remove(name)
 
     def _command(self, model: str, conversation: str | None) -> list[str]:
         binary = Path(self.job["agy_bin"])
@@ -265,6 +280,16 @@ class JobRunner:
             conversation_id=conversation,
             json_schema=Path(schema) if schema else None,
         )
+        name = self._container_name()
+        if name:
+            return container.wrap(
+                command,
+                name=name,
+                worktree=Path(self.job["worktree"]),
+                job_dir=self.dir,
+                plugin_root=Path(self.job["plugin_root"]),
+                read_dirs=[Path(p) for p in self.job.get("read_dirs") or []],
+            )
         if self.job.get("os_sandbox"):
             command = sandbox.wrap(
                 command,
@@ -309,6 +334,7 @@ class JobRunner:
                 env=env,
                 tool_stall_seconds=float(self.job.get("tool_stall_seconds", DEFAULT_TOOL_STALL_SECONDS)),
                 on_start=self._record_agy_pid,
+                on_stop=self._stop_container,
             )
             # A finished turn reports its total; an interrupted one only its steps.
             turn_usage = (outcome.result or {}).get("usage") or self.step_usage
@@ -391,11 +417,11 @@ class JobRunner:
             if patch_file.exists():
                 patch_file.unlink()  # never leave an earlier round's patch for apply
             try:
-                changes = gitctx.export_changes(Path(self.job["worktree"]), self.job["baseline"])
+                changes = self._export_changes()
                 patch_file.write_bytes(changes["patch"])
                 stored["changed_files"] = changes["name_status"]
                 stored["changed_paths"] = changes["paths"]
-            except gitctx.GitError as exc:
+            except (gitctx.GitError, RuntimeError) as exc:
                 error = error or f"could not export agy's changes: {exc}"
 
         write_json(self.dir / "result.json", stored)
@@ -420,6 +446,7 @@ class JobRunner:
                     "error": error,
                     "pid": None,
                     "agy_pid": None,
+                    "container": None,
                     "model": round_record["final_model"],
                     "completed_at": now_iso(),
                     "queued_commands": commands,
@@ -436,6 +463,24 @@ class JobRunner:
         if self.job.get("kind") != "task" and record.get("status") in ("completed", "failed", "cancelled"):
             gitctx.remove_worktree(self.job["repo_root"], Path(self.job["worktree"]))
         return record
+
+    def _export_changes(self) -> dict[str, Any]:
+        """agy's changes as a patch. A container job computes it inside the
+        container, so the host runs no git over files agy has written."""
+        worktree = Path(self.job["worktree"])
+        if self.job.get("isolation") != "container":
+            return gitctx.export_changes(worktree, self.job["baseline"])
+        for stale in ("changes.patch", "changes.json"):
+            (self.dir / stale).unlink(missing_ok=True)
+        command = container.export_command(worktree, self.job["baseline"], self.dir, Path(self.job["plugin_root"]))
+        proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        if proc.returncode != 0:
+            raise RuntimeError(f"the export container failed: {proc.stderr.strip()[-500:]}")
+        summary = read_json(self.dir / "changes.json")
+        patch_file = self.dir / "changes.patch"
+        if not isinstance(summary, dict) or not patch_file.is_file():
+            raise RuntimeError("the export container wrote no result")
+        return {"patch": patch_file.read_bytes(), "name_status": summary["name_status"], "paths": summary["paths"]}
 
 
 def _parse_review(result: dict[str, Any], schema: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
@@ -543,6 +588,8 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
     escalating to SIGKILL after one shared grace period."""
     groups = set()
     for job in jobs:
+        if job.get("container"):
+            container.remove(str(job["container"]))
         for key in ("pid", "agy_pid"):
             pid = job.get(key)
             if not pid:
