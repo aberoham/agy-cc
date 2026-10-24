@@ -53,15 +53,21 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     worktree = Path(job["worktree"])
     state = Path(contained.env["AGY_COMPANION_STATE_DIR"])
     home = Path(contained.env["AGY_CONTAINER_HOME"])
+    job_mount = worktree.parent.parent / "jobs" / job["id"] / "container"
     probe, run = contained.docker_runs()
-    assert "touch" in probe and str(state) in " ".join(probe)
+    assert "touch" in probe and str(state) in " ".join(probe) and str(home) in " ".join(probe)
     options = _run_options(run)
     volumes = [o[len("--volume=") :] for o in options if o.startswith("--volume=")]
-    assert f"{worktree}:{worktree}:ro" in volumes  # a review never edits the copy
-    assert f"{home}:{home}" in volumes
-    plugin = next(v for v in volumes if v.endswith(":ro") and "plugins/agy" in v)
-    assert plugin.split(":")[0] == job["plugin_root"]
+    # Exactly these, and nothing else: the job record and result stay outside.
+    assert volumes == [
+        f"{worktree}:{worktree}:ro",  # a review never edits the copy
+        f"{job_mount}:{job_mount}",
+        f"{home}:{home}",
+        f"{job['plugin_root']}:{job['plugin_root']}:ro",
+    ]
     assert not any(str(repo) in v for v in volumes)
+    assert (job_mount / "agy.log").parent == job_mount
+    assert run[run.index("--log-file") + 1] == str(job_mount / "agy.log")
     assert "--init" in options and f"--env=HOME={home}" in options
     assert any(o.startswith("--name=agy-review-") for o in options)
     assert run[-1] == "--dangerously-skip-permissions"
@@ -103,8 +109,10 @@ def test_container_task_keeps_repository_hooks_and_exports_from_inside(contained
     export = contained.docker_runs()[-1]
     assert "_export" in export and "--entrypoint" in export
     assert f"--name=agy-{job['id']}-1-export" in export and "--init" in export
-    volumes = [o for o in export if o.startswith("--volume=")]
-    assert f"--volume={worktree}:{worktree}" in volumes
+    assert [o for o in export if o.startswith("--volume=")] == [
+        o for o in contained.docker_runs()[1] if o.startswith("--volume=")
+    ]
+    assert export[-1] == str(worktree.parent.parent / "jobs" / job["id"] / "container")
     calls = [json.loads(line) for line in contained.docker_calls.read_text().splitlines()]
     assert ["rm", "--force", f"agy-{job['id']}-1-export"] in calls
     assert job["container"] is None
@@ -166,17 +174,21 @@ def test_wrap_puts_every_mount_at_its_host_path(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", str(tmp_path))
     (tmp_path / "docker").write_text("")
     (tmp_path / "docker").chmod(0o755)
-    command = container.wrap(
-        ["agy", "--model", "x", "--print="],
-        name="agy-job-1",
-        worktree=tmp_path / "wt",
-        job_dir=tmp_path / "job",
-        plugin_root=tmp_path / "plugin",
-        read_dirs=[tmp_path / "docs"],
-        writable=True,
-    )
+    mounts = container.Mounts(tmp_path / "wt", tmp_path / "job", tmp_path / "plugin", [tmp_path / "docs"], True)
+    command = container.wrap(["agy", "--model", "x", "--print="], name="agy-job-1", mounts=mounts)
     assert command[0] == str(tmp_path / "docker")
-    assert command[1:4] == ["run", "--rm", "--interactive"]
+    assert command[1] == "run" and "--rm" in command[:5] and "--interactive" in command[:5]
     assert f"--volume={tmp_path / 'docs'}:{tmp_path / 'docs'}:ro" in command
+    assert f"--volume={tmp_path / 'job' / 'container'}:{tmp_path / 'job' / 'container'}" in command
+    assert not any(o == f"--volume={tmp_path / 'job'}:{tmp_path / 'job'}" for o in command)
     assert command[-4:] == ["--model", "x", "--print=", "--dangerously-skip-permissions"]
     assert "agy" not in command[command.index(container.DEFAULT_IMAGE) + 1 :]
+
+
+def test_apply_refuses_a_job_without_a_baseline_snapshot(contained, repo):
+    contained.run("task", "fix the bug", scenario="container")
+    job = contained.job()
+    (Path(job["worktree"]).parent.parent / "jobs" / job["id"] / "baseline-tree.json").unlink()
+    proc = contained.run("apply", check=False)
+    assert proc.returncode == 2 and "no baseline snapshot" in proc.stderr
+    assert "sum(v[1:])" in (repo / "stats.py").read_text()

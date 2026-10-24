@@ -297,6 +297,8 @@ def main() -> int:
             words = line.split()
             if words[:1] == ["probe-read"]:
                 notes.append(f"read {words[1]}: {'exists' if Path(words[1]).exists() else 'missing'}")
+            if words[:1] == ["probe-stall"]:
+                time.sleep(3600)
             if words[:1] == ["probe-filter"]:
                 (cwd / ".gitattributes").write_text("*.py filter=x\n")
                 subprocess.run(["git", "config", "filter.x.clean", f"touch {words[1]}"], cwd=cwd, check=True)

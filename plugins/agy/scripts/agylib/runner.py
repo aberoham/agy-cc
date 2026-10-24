@@ -243,8 +243,10 @@ class JobRunner:
             if step.get("state") == "DONE":
                 self.progress["tools"] += 1
                 path = params.get("Path") or params.get("TargetFile")
-                if name in WRITE_TOOLS and isinstance(path, str) and "/brain/" in path and path.endswith(".md"):
-                    self.plan_paths.append(path)
+                if name in WRITE_TOOLS and isinstance(path, str) and path.endswith(".md"):
+                    # Only a file under the brain directory is read back on the host.
+                    if os.path.normpath(path).startswith(self._plan_root()):
+                        self.plan_paths.append(path)
             if step.get("state") == "ERROR":
                 message = str((info.get("error") or {}).get("message", ""))
                 match = PERMISSION_DENIED.search(message)
@@ -264,6 +266,27 @@ class JobRunner:
             return None
         return container.container_name(self.job_id, int(self.job.get("generation") or 1))
 
+    def _mounts(self, writable: bool) -> container.Mounts:
+        return container.Mounts(
+            Path(self.job["worktree"]),
+            self.dir,
+            Path(self.job["plugin_root"]),
+            [Path(p) for p in self.job.get("read_dirs") or []],
+            writable=writable,
+        )
+
+    @property
+    def log_path(self) -> Path:
+        """agy's log. A container job writes it into the one job subdirectory the container may see."""
+        if self.job.get("isolation") == "container":
+            return container.job_mount(self.dir) / "agy.log"
+        return self.dir / "agy.log"
+
+    def _plan_root(self) -> str:
+        """Where a plan artifact may be read from: agy's brain directory for the job's home."""
+        home = container.agy_home() if self.job.get("isolation") == "container" else Path.home()
+        return str(home / ".gemini" / "antigravity-cli" / "brain") + os.sep
+
     def _stop_container(self) -> None:
         name = self._container_name()
         if name:
@@ -276,21 +299,14 @@ class JobRunner:
             binary,
             model=model,
             mode=self.job["mode"],
-            log_file=self.dir / "agy.log",
+            log_file=self.log_path,
             conversation_id=conversation,
             json_schema=Path(schema) if schema else None,
         )
         name = self._container_name()
         if name:
-            return container.wrap(
-                command,
-                name=name,
-                worktree=Path(self.job["worktree"]),
-                job_dir=self.dir,
-                plugin_root=Path(self.job["plugin_root"]),
-                read_dirs=[Path(p) for p in self.job.get("read_dirs") or []],
-                writable=bool(self.job.get("writable")) and not self.job.get("read_only_round"),
-            )
+            writable = bool(self.job.get("writable")) and not self.job.get("read_only_round")
+            return container.wrap(command, name=name, mounts=self._mounts(writable))
         if self.job.get("os_sandbox"):
             command = sandbox.wrap(
                 command,
@@ -327,7 +343,7 @@ class JobRunner:
                 cwd=Path(self.job["worktree"]),
                 message=message,
                 events_path=self.dir / "events.ndjson",
-                log_path=self.dir / "agy.log",
+                log_path=self.log_path,
                 stderr_path=self.dir / "agy.stderr.txt",
                 stall_seconds=stall_seconds,
                 deadline=deadline,
@@ -474,14 +490,15 @@ class JobRunner:
         worktree = Path(self.job["worktree"])
         if self.job.get("isolation") != "container":
             return gitctx.export_changes(worktree, self.job["baseline"])
+        mount = container.job_mount(self.dir)
         for stale in ("changes.patch", "changes.json"):
-            (self.dir / stale).unlink(missing_ok=True)
+            (mount / stale).unlink(missing_ok=True)
         # The export container is recorded on the job like the turn's, so a
         # cancel or a session end removes it too; the finally covers a timeout.
         name = f"{self._container_name()}-export"
-        command = container.export_command(
-            worktree, self.job["baseline"], self.dir, Path(self.job["plugin_root"]), name
-        )
+        # The export stages agy's edits in the copy's own index, so it needs
+        # the copy writable even after a read-only round.
+        command = container.export_command(self.job["baseline"], name=name, mounts=self._mounts(writable=True))
         self.store.update(self.job_id, lambda r: r.update({"container": name}))
         try:
             proc = subprocess.run(command, capture_output=True, text=True, timeout=600)
@@ -489,8 +506,8 @@ class JobRunner:
             container.remove(name)
         if proc.returncode != 0:
             raise RuntimeError(f"the export container failed: {proc.stderr.strip()[-500:]}")
-        summary = read_json(self.dir / "changes.json")
-        patch_file = self.dir / "changes.patch"
+        summary = read_json(mount / "changes.json")
+        patch_file = mount / "changes.patch"
         if not isinstance(summary, dict) or not patch_file.is_file():
             raise RuntimeError("the export container wrote no result")
         return {"patch": patch_file.read_bytes(), "name_status": summary["name_status"], "paths": summary["paths"]}
@@ -600,9 +617,8 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
     """Stop the workers and agy process groups of several jobs at once,
     escalating to SIGKILL after one shared grace period."""
     groups = set()
+    containers = [str(job["container"]) for job in jobs if job.get("container")]
     for job in jobs:
-        if job.get("container"):
-            container.remove(str(job["container"]))
         for key in ("pid", "agy_pid"):
             pid = job.get(key)
             if not pid:
@@ -619,10 +635,14 @@ def terminate_job_processes(jobs: list[dict[str, Any]], grace: float = STOP_GRAC
             # stop the user's own programs.
             if group == int(pid) and str(job.get("id", "")) in _command_line(int(pid)):
                 groups.add(group)
-    if not groups:
-        return False
     for group in groups:
         _signal_group(group, signal.SIGTERM)
+    # Containers after the signals, so a slow Docker daemon never delays them,
+    # and within the same grace period so a session-end hook stays in budget.
+    for name in containers:
+        container.remove(name, timeout=max(grace, 3))
+    if not groups:
+        return bool(containers)
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         if not any(_signal_group(group, 0) for group in groups):

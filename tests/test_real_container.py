@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -51,6 +52,11 @@ def scratch():
         yield root
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def _job(scratch: Path) -> tuple[Path, dict]:
+    (job_file,) = (scratch / "state").glob("*/jobs/*/job.json")
+    return job_file, json.loads(job_file.read_text())
 
 
 def _companion(scratch: Path, cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -104,8 +110,7 @@ def test_task_in_a_real_container_reaches_only_the_working_copy(image, scratch):
         f"fix the bug\nprobe-read {secret}\nprobe-filter {filter_marker}",
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
-    (job_file,) = (scratch / "state").glob("*/jobs/*/job.json")
-    job = json.loads(job_file.read_text())
+    job_file, job = _job(scratch)
     assert job["status"] == "completed", job
     assert job["isolation"] == "container"
     stored = json.loads((job_file.parent / "result.json").read_text())
@@ -127,3 +132,31 @@ def test_task_in_a_real_container_reaches_only_the_working_copy(image, scratch):
     assert (repo / "stats.py").read_text() == "fixed\n"
     assert (repo / "hook-marker").exists()
     assert not filter_marker.exists()
+
+
+def test_cancel_removes_a_running_container(image, scratch):
+    repo = scratch / "repo"
+    repo.mkdir()
+    git(repo, "init", "-q", "-b", "main")
+    (repo / "stats.py").write_text("x\n")
+    git(repo, "add", ".")
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "init")
+    proc = _companion(scratch, repo, "task", "--isolation", "container", "--background", "probe-stall")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        _, job = _job(scratch)
+        if job.get("container"):
+            break
+        time.sleep(0.5)
+    name = job["container"]
+    assert name == f"agy-{job['id']}-1"
+    running = subprocess.run(["docker", "ps", "--quiet", "--filter", f"name=^{name}$"], capture_output=True, text=True)
+    assert running.stdout.strip(), "the job's container is not running"
+    proc = _companion(scratch, repo, "cancel", job["id"])
+    assert "Cancelled" in proc.stdout, proc.stdout + proc.stderr
+    left = subprocess.run(
+        ["docker", "ps", "--all", "--quiet", "--filter", f"name=^{name}$"], capture_output=True, text=True
+    )
+    assert not left.stdout.strip(), "the container survived the cancel"
+    assert _job(scratch)[1]["status"] == "cancelled"

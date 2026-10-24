@@ -145,8 +145,12 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
 - The task was asked to list `~/.aws`, `~/.ssh` and the host's `~/.gemini`;
   the model declined on policy grounds and the Gemini API also returned a
   content-safety error for that turn, so the job ended `failed` while its
-  patch was still exported. The fake-agy test inside a real container is what
-  shows those paths are absent.
+  patch was still exported. So no live run has shown those paths absent. The
+  fake-agy test inside a real container checks one file outside the working
+  copy, a tracked hook, a git clean filter, a read-only round and a cancel.
+- `AGY_SMOKE_ISOLATION=container scripts/live-smoke.sh --apply` passed every
+  step on 24 October 2026 (review 79 s, adversarial review 17 s, plan 93 s,
+  task 25 s, apply check, cancel with no container left).
 - In plan mode inside the container agy used its research subagent; the
   host policy blocked subagents, the container does not.
 - In-container sign-in with `containers/signin.sh` is not yet tested (it

@@ -1,11 +1,14 @@
 """Run agy inside a Linux container, with the container as the isolation boundary.
 
-The container sees the job's working copy, the job's state directory, the
-plugin's own files (read-only) and a separate agy home that holds the
-container sign-in. Each is mounted at its host path, so paths in agy's
-output, in its log and in the plan artifact mean the same thing on both
-sides and nothing has to be translated. Nothing else from the host is
-mounted, so a prompt-injected "read ~/.aws/credentials" finds no such file.
+The container sees the job's working copy, one subdirectory of the job's
+state directory (for agy's log and the exported patch), the plugin's own
+files (read-only) and a separate agy home that holds the container sign-in.
+Each is mounted at its host path, so paths in agy's output, in its log and
+in the plan artifact mean the same thing on both sides and nothing has to be
+translated. Nothing else from the host is mounted, so a prompt-injected
+"read ~/.aws/credentials" finds no such file. The job record, the baseline
+snapshot and the result stay outside the mount: the host trusts them, so
+nothing inside the container may write them.
 
 Inside the container agy runs with --dangerously-skip-permissions: it may
 run any command and edit any file it can reach, and what it can reach is the
@@ -28,6 +31,7 @@ IMAGE_ENV = "AGY_IMAGE"
 DEFAULT_IMAGE = "agy-sandbox:experiment"
 HOME_ENV = "AGY_CONTAINER_HOME"
 WORKSPACE_PROBE = ".agy-mount-probe-"  # plus a random suffix, see state_mountable
+JOB_MOUNT = "container"  # the one job subdirectory the container may write
 DOCKER_TIMEOUT = 60
 # The working copy was created by the host user; through a virtual machine's
 # shared filesystem its owner can differ from the container's user, and git
@@ -84,34 +88,39 @@ def image_present() -> bool:
     return bool(proc and proc.returncode == 0)
 
 
+def job_mount(job_dir: Path) -> Path:
+    return job_dir / JOB_MOUNT
+
+
 def state_mountable() -> bool:
-    """Whether the container can write into the plugin's state directory.
+    """Whether the container can write into the plugin's state directory and the container home.
 
     A Docker virtual machine on macOS shares only some host directories
     (Colima shares the home directory, not /var/folders), so a state root in
     the system temporary directory cannot hold a job. The probe touches a
-    file in the state root from inside the container. Its name is fresh each
-    time: the virtual machine's shared filesystem caches a file the host has
-    since deleted, and touching that name again creates nothing the host can
-    see.
+    file in each directory from inside the container. The names are fresh
+    each time: the virtual machine's shared filesystem caches a file the host
+    has since deleted, and touching that name again creates nothing the host
+    can see.
     """
-    root = state_root()
-    root.mkdir(parents=True, exist_ok=True)
-    probe = root / (WORKSPACE_PROBE + secrets.token_hex(4))
+    probes = []
+    for directory in (state_root(), agy_home()):
+        directory.mkdir(parents=True, exist_ok=True)
+        probes.append(directory / (WORKSPACE_PROBE + secrets.token_hex(4)))
     proc = _docker(
         "run",
         "--rm",
         f"--user={os.getuid()}:{os.getgid()}",
         "--entrypoint",
         "touch",
-        f"--volume={root}:{root}",
+        *[f"--volume={p.parent}:{p.parent}" for p in probes],
         image_name(),
-        str(probe),
+        *[str(p) for p in probes],
         timeout=DOCKER_TIMEOUT,
     )
-    written = probe.is_file()
-    if written:
-        probe.unlink()
+    written = all(p.is_file() for p in probes)
+    for probe in probes:
+        probe.unlink(missing_ok=True)
     return bool(proc and proc.returncode == 0 and written)
 
 
@@ -153,16 +162,48 @@ def container_name(job_id: str, generation: int) -> str:
     return f"agy-{job_id}-{generation}"
 
 
-def wrap(
-    agy_args: list[str],
-    *,
-    name: str,
-    worktree: Path,
-    job_dir: Path,
-    plugin_root: Path,
-    read_dirs: list[Path],
-    writable: bool,
-) -> list[str]:
+class Mounts:
+    """What a job's containers may see, shared by the agy turn and the export
+    so that a program agy relies on (a git filter in the home, say) is there
+    for both."""
+
+    def __init__(self, worktree: Path, job_dir: Path, plugin_root: Path, read_dirs: list[Path], writable: bool):
+        self.worktree = worktree
+        self.job_mount = job_mount(job_dir)
+        self.plugin_root = plugin_root
+        self.read_dirs = read_dirs
+        self.writable = writable
+        self.home = agy_home()
+
+    def prefix(self, name: str) -> list[str]:
+        """docker run options: identity, environment and the volumes."""
+        binary = docker_bin()
+        if not binary:
+            raise RuntimeError("docker is not installed or not on PATH")
+        (self.home / ".gemini").mkdir(parents=True, exist_ok=True)
+        self.job_mount.mkdir(parents=True, exist_ok=True)
+        command = [
+            str(binary),
+            "run",
+            "--rm",
+            "--init",
+            f"--name={name}",
+            f"--user={os.getuid()}:{os.getgid()}",
+            f"--env=HOME={self.home}",
+            "--env=PYTHONDONTWRITEBYTECODE=1",
+            *GIT_ENV,
+            f"--volume={self.worktree}:{self.worktree}" + ("" if self.writable else ":ro"),
+            f"--volume={self.job_mount}:{self.job_mount}",
+            f"--volume={self.home}:{self.home}",
+            f"--volume={self.plugin_root}:{self.plugin_root}:ro",
+        ]
+        for directory in self.read_dirs:
+            command.append(f"--volume={directory}:{directory}:ro")
+        command.append(f"--workdir={self.worktree}")
+        return command
+
+
+def wrap(agy_args: list[str], *, name: str, mounts: Mounts) -> list[str]:
     """The docker command that runs agy's arguments inside the container.
 
     agy_args comes from agybin.build_command without the binary, which the
@@ -172,65 +213,29 @@ def wrap(
     mounts the working copy read-only, which is what enforces it: inside the
     container agy has no permission checks.
     """
-    home = agy_home()
-    (home / ".gemini").mkdir(parents=True, exist_ok=True)
-    binary = docker_bin()
-    if not binary:
-        raise RuntimeError("docker is not installed or not on PATH")
-    command = [
-        str(binary),
-        "run",
-        "--rm",
-        "--interactive",
-        "--init",
-        f"--name={name}",
-        f"--user={os.getuid()}:{os.getgid()}",
-        f"--env=HOME={home}",
-        "--env=PYTHONDONTWRITEBYTECODE=1",
-        *GIT_ENV,
-        f"--volume={worktree}:{worktree}" + ("" if writable else ":ro"),
-        f"--volume={job_dir}:{job_dir}",
-        f"--volume={home}:{home}",
-        f"--volume={plugin_root}:{plugin_root}:ro",
-    ]
-    for directory in read_dirs:
-        command.append(f"--volume={directory}:{directory}:ro")
-    command += [f"--workdir={worktree}", image_name(), *agy_args[1:], *agybin.SKIP_PERMISSIONS_FLAGS]
-    return command
+    command = mounts.prefix(name)
+    command.insert(2, "--interactive")
+    return command + [image_name(), *agy_args[1:], *agybin.SKIP_PERMISSIONS_FLAGS]
 
 
-def export_command(worktree: Path, baseline: str, job_dir: Path, plugin_root: Path, name: str) -> list[str]:
-    """A docker command that computes the job's patch inside the container."""
-    binary = docker_bin()
-    if not binary:
-        raise RuntimeError("docker is not installed or not on PATH")
-    companion = plugin_root / "scripts" / "agy_companion.py"
+def export_command(baseline: str, *, name: str, mounts: Mounts) -> list[str]:
+    """A docker command that computes the job's patch inside the container,
+    into the job's mounted subdirectory."""
+    companion = mounts.plugin_root / "scripts" / "agy_companion.py"
     return [
-        str(binary),
-        "run",
-        "--rm",
-        "--init",
-        f"--name={name}",
-        f"--user={os.getuid()}:{os.getgid()}",
-        f"--env=HOME={agy_home()}",
-        "--env=PYTHONDONTWRITEBYTECODE=1",
-        *GIT_ENV,
+        *mounts.prefix(name),
         "--entrypoint",
         "python3",
-        f"--volume={worktree}:{worktree}",
-        f"--volume={job_dir}:{job_dir}",
-        f"--volume={plugin_root}:{plugin_root}:ro",
-        f"--workdir={worktree}",
         image_name(),
         str(companion),
         "_export",
-        str(worktree),
+        str(mounts.worktree),
         baseline,
-        str(job_dir),
+        str(mounts.job_mount),
     ]
 
 
-def remove(name: str) -> None:
+def remove(name: str, timeout: float = 30) -> None:
     """Stop and remove the container, if it still exists. Stopping the docker
     client does not stop the container, so this runs after every turn."""
-    _docker("rm", "--force", name, timeout=30)
+    _docker("rm", "--force", name, timeout=timeout)

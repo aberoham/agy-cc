@@ -67,10 +67,13 @@ the patch format so your diff and colour settings cannot break it.
 ### Container mode
 
 agy runs in a Linux container (`containers/Dockerfile`) that can see four
-things, each mounted at its host path: the working copy, the job's state
-directory, the plugin's own files (read-only) and a separate agy home
-(`~/.gemini/agy-container-home`) that holds the container sign-in. Nothing else from your
-machine is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read.
+things, each mounted at its host path: the working copy, one subdirectory of
+the job's state directory (for agy's log and the exported patch), the
+plugin's own files (read-only) and a separate agy home
+(`~/.gemini/agy-container-home`) that holds the container sign-in. Nothing
+else from your machine is mounted, so there is no `~/.aws`, `~/.ssh` or
+keychain to read, and the job record, the baseline snapshot and the result,
+which the host trusts, are out of the container's reach.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs
 the commands it needs, including your tests, and edits what it likes, and
 all of that lands in the working copy. For a review, a plan or a task round

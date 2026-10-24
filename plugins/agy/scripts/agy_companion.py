@@ -557,7 +557,12 @@ def cmd_apply(args: argparse.Namespace) -> int:
         return 0
     stored = read_json(job_dir / "result.json", {}) or {}
     root = Path(job["repo_root"])
-    tree = read_json(job_dir / "baseline-tree.json", {}) or {}
+    tree = read_json(job_dir / "baseline-tree.json")
+    if not isinstance(tree, dict):
+        raise UsageError(
+            f"Job {job['id']} has no baseline snapshot (it predates this version of the plugin), so the drift "
+            f"check cannot run. Review the patch at {patch_file} and apply it with git apply, or start a new job."
+        )
     moved = gitctx.baseline_mismatches(root, tree, stored.get("changed_paths") or [])
     if moved and not args.force:
         listed = "\n".join(f"- {path}" for path in moved)
