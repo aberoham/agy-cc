@@ -58,6 +58,8 @@ def test_a_home_behind_a_link_still_works(tmp_path, monkeypatch):
     assert (
         runner._read_plan(tmp_path / "home" / ".gemini" / "antigravity-cli" / "brain" / "abc" / "plan.md") == "# Plan\n"
     )
+    # agy may report the path through the home's real name.
+    assert runner._read_plan(real_home / ".gemini" / "antigravity-cli" / "brain" / "abc" / "plan.md") == "# Plan\n"
 
 
 def test_a_named_pipe_in_place_of_the_plan_does_not_hang(tmp_path, monkeypatch):

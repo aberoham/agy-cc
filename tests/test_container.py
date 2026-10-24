@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 
 from agylib import container
@@ -187,12 +188,30 @@ def test_a_resumed_round_keeps_the_conversation_and_refreshes_the_sign_in(contai
     (cli / "settings.json").write_text('{"hooks": "changed by a round"}')
     signin = Path(contained.env["AGY_CONTAINER_HOME"]) / ".gemini" / "antigravity-cli"
     (signin / "antigravity-oauth-token").write_text('{"fresh": true}')  # a new sign-in since round 1
+    (signin / "settings.json").write_text('{"enableTerminalSandbox": false, "gcp": {"project": "p"}}\n')
     proc = contained.run("task", "--resume-last", "carry on", scenario="container")
     job = contained.job()
     assert job["status"] == "completed", proc.stdout
     assert "Continued" in proc.stdout  # the fake refuses to resume without its conversation file
-    assert (cli / "settings.json").read_text() == '{"enableTerminalSandbox": false}\n'
+    assert (cli / "settings.json").read_text() == '{"enableTerminalSandbox": false, "gcp": {"project": "p"}}\n'
     assert (cli / "antigravity-oauth-token").read_text() == '{"fresh": true}'
+
+
+def test_seeding_never_writes_through_a_link_a_round_planted(contained, repo, tmp_path):
+    contained.run("task", "fix the bug", scenario="container")
+    job = contained.job()
+    home = Path(job["worktree"]).parent.parent / "jobs" / job["id"] / "container" / "home"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "settings.json").write_text("precious\n")
+    cli = home / ".gemini" / "antigravity-cli"
+    shutil.rmtree(cli)
+    os.symlink(outside, cli)  # what a round could do to the agent-writable home
+    proc = contained.run("task", "--resume-last", "carry on", scenario="container", check=False)
+    assert contained.job()["status"] == "failed"
+    assert "not a plain directory" in (contained.job().get("error") or "") + proc.stdout
+    assert (outside / "settings.json").read_text() == "precious\n"
+    assert not (outside / "antigravity-oauth-token").exists()
 
 
 def test_a_new_job_never_sees_another_jobs_home(contained, repo):
@@ -218,10 +237,16 @@ def test_the_export_runs_with_an_empty_home_and_no_git_configuration(contained, 
 
 
 def test_read_dirs_overlapping_the_sign_in_or_state_are_refused(contained, tmp_path):
-    for target in (contained.env["AGY_CONTAINER_HOME"], contained.env["AGY_COMPANION_STATE_DIR"], str(tmp_path)):
+    signin = contained.env["AGY_CONTAINER_HOME"]
+    for target in (signin, f"{signin}/.gemini", contained.env["AGY_COMPANION_STATE_DIR"], str(tmp_path), "/"):
         proc = contained.run("review", "--read-dir", target, scenario="review", check=False)
         assert proc.returncode == 2 and "--read-dir refused" in proc.stderr, target
     assert contained.jobs() == []
+    unrelated = tmp_path.parent / f"{tmp_path.name}-docs"
+    unrelated.mkdir()
+    proc = contained.run("review", "--read-dir", str(unrelated), scenario="review")
+    assert "Verdict" in proc.stdout
+    assert f"--volume={unrelated}:{unrelated}:ro" in contained.docker_runs()[-1]
 
 
 def test_plans_are_read_from_the_job_home(contained):
@@ -260,6 +285,7 @@ def test_wrap_puts_every_mount_at_its_host_path(tmp_path, monkeypatch):
     (tmp_path / "docker").write_text("")
     (tmp_path / "docker").chmod(0o755)
     (tmp_path / "container-home" / ".gemini" / "antigravity-cli").mkdir(parents=True)
+    (tmp_path / "job").mkdir()
     container.seed_home(tmp_path / "job")
     mounts = container.Mounts(tmp_path / "wt", tmp_path / "job", tmp_path / "plugin", [tmp_path / "docs"], True)
     command = container.wrap(["agy", "--model", "x", "--print="], name="agy-job-1", mounts=mounts)

@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -110,28 +111,53 @@ def seed_home(job_dir: Path) -> Path:
     keeps working: refreshing does not rotate it, so copies refreshed
     independently stay valid until the pool session ends.
     """
-    home = job_home(job_dir)
-    if home.is_symlink():
-        raise RuntimeError(f"the job's home {home} is a link; refusing to use it")
-    target = home / ".gemini" / "antigravity-cli"
-    target.mkdir(parents=True, exist_ok=True)
     source = signin_home() / ".gemini" / "antigravity-cli"
-    for name in SIGNIN_FILES:
-        if (source / name).is_file():
-            _write_private(target / name, (source / name).read_bytes())
-    if not (source / "settings.json").is_file():
-        _write_private(target / "settings.json", DEFAULT_SETTINGS.encode())
-    return home
+    # Every directory below the job directory is agent-writable, so a round
+    # could have replaced one with a link to somewhere on the host. Descend
+    # with directory descriptors that refuse links, and write through them.
+    fd = os.open(str(job_dir), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in (JOB_MOUNT, "home", ".gemini", "antigravity-cli"):
+            fd = _descend(fd, name)
+        for name in SIGNIN_FILES:
+            if (source / name).is_file():
+                _write_private(fd, name, (source / name).read_bytes())
+        if not (source / "settings.json").is_file():
+            _write_private(fd, "settings.json", DEFAULT_SETTINGS.encode())
+    finally:
+        os.close(fd)
+    return job_home(job_dir)
 
 
-def _write_private(path: Path, data: bytes) -> None:
-    """Create or replace a file with mode 0600 from the start, never through a link."""
-    if path.is_symlink():
-        path.unlink()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+def _descend(parent_fd: int, name: str) -> int:
+    """Open (creating if needed) the directory `name` under parent_fd, refusing a link.
+
+    On success the parent descriptor is closed and the child returned; on
+    failure the parent stays open for the caller to close.
+    """
+    try:
+        os.mkdir(name, 0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    try:
+        child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
+    except OSError as exc:
+        raise RuntimeError(f"the job's home component {name!r} is not a plain directory: {exc.strerror}") from exc
+    os.close(parent_fd)
+    return child
+
+
+def _write_private(dir_fd: int, name: str, data: bytes) -> None:
+    """Create or replace a file under dir_fd with mode 0600 from the start, never through a link."""
+    try:
+        if stat.S_ISLNK(os.lstat(name, dir_fd=dir_fd).st_mode):
+            os.unlink(name, dir_fd=dir_fd)
+    except FileNotFoundError:
+        pass
+    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=dir_fd)
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
-    os.chmod(path, 0o600)
+    os.chmod(name, 0o600, dir_fd=dir_fd, follow_symlinks=False)
 
 
 def export_home(job_dir: Path) -> Path:
@@ -167,10 +193,10 @@ def remove_tree(path: Path) -> None:
 
 def overlaps_protected(directory: Path) -> str | None:
     """Why a --read-dir may not be mounted: it would expose the sign-in or other jobs' state."""
-    wanted = os.path.realpath(directory)
+    wanted = Path(os.path.realpath(directory))
     for label, protected in (("the container sign-in", signin_home()), ("the plugin's state directory", state_root())):
-        real = os.path.realpath(protected)
-        if wanted == real or real.startswith(wanted + os.sep) or wanted.startswith(real + os.sep):
+        real = Path(os.path.realpath(protected))
+        if wanted == real or wanted in real.parents or real in wanted.parents:
             return f"{directory} overlaps {label} ({protected})"
     return None
 
