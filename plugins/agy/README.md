@@ -214,9 +214,10 @@ For that, run `scripts/live-smoke.sh --apply` from the source repository on a
 machine where agy is signed in (`AGY_SMOKE_ISOLATION=container` or `host`
 picks the mode; the default is whatever `/agy:setup` would choose). In a
 throwaway repository it runs the
-companion's setup, review, adversarial review, plan, task, resume, result,
-apply check and cancel against the real agy, checks each result, and prints
-the approval-round table. `/agy:rescue` itself is not run: it is a Claude
+companion's setup, review, adversarial review, plan, task, resume (or, when
+agy queued nothing, a `--resume-last` follow-up that must recall a code word
+from the first round), result, apply check and cancel against the real agy,
+checks each result, and prints the approval-round table. `/agy:rescue` itself is not run: it is a Claude
 subagent that calls the same `task` command. Code agy wrote runs only under a
 write sandbox, so on Linux those checks are skipped. It uses your Gemini
 licence, so without `--apply` it only lists the steps. `--with-claude` also
