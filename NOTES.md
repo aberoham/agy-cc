@@ -184,6 +184,16 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   and plan, and its task, apply and cancel steps hit the same expiry. Rerun
   both smokes after signing in again before relying on them.
 
+- Image tooling (24 October 2026, after Abe asked for Sandcastle's lessons):
+  the image gained `uv` and `jq` and a numeric `USER`, and the companion a
+  pre-flight that compares the image's user with the host's. A live
+  container task on `gemini-4-argon-low` ran
+  `uv run --no-project --python /usr/bin/python3 --with pytest pytest -q`
+  inside the container (pytest fetched through the interception roots),
+  saw the planted failure, fixed `stats.py` and reran it green, in one
+  round with no queued commands. Earlier the same request had ended with
+  "No module named pytest".
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)
