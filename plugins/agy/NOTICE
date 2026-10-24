@@ -1,0 +1,37 @@
+agy plugin for Claude Code
+Copyright 2026 Abraham Ingersoll
+
+This product includes software adapted from codex-plugin-cc
+(https://github.com/openai/codex-plugin-cc), Copyright 2026 OpenAI,
+licensed under the Apache License, Version 2.0.
+
+Modifications: the following files were adapted from codex-plugin-cc and
+changed to drive Google's Antigravity CLI (agy) instead of Codex.
+
+- plugins/agy/commands/*.md, from plugins/codex/commands/*.md: rewritten for
+  agy jobs; added plan and approve commands; removed transfer.
+- plugins/agy/agents/agy-rescue.md, from plugins/codex/agents/codex-rescue.md:
+  rewritten for the agy runtime.
+- plugins/agy/skills/agy-cli-runtime, agy-result-handling and
+  gemini-prompting, from plugins/codex/skills/codex-cli-runtime,
+  codex-result-handling and gpt-5-4-prompting: rewritten for agy and Gemini;
+  result handling adds verification of quotes and file:line claims.
+- plugins/agy/prompts/adversarial-review.md, from
+  plugins/codex/prompts/adversarial-review.md: reworded for Gemini.
+- plugins/agy/schemas/review-output.schema.json: copied unchanged.
+- plugins/agy/scripts/: a Python reimplementation of the job state, job
+  tracking, git review-context and rendering ideas in
+  plugins/codex/scripts/lib/{state,tracked-jobs,job-control,render,git,workspace}.mjs.
+  The app-server, broker and session-transfer code was not carried over.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
