@@ -109,6 +109,20 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   and 21,354 tokens. Under `sandbox-exec`, agy needs write access to
   `/dev/ptmx` to run any command.
 
+- Live adversarial review of the plugin's own branch (24 October 2026,
+  `--model high`): `gemini-4-argon-high` stalled with "stream idle timeout"
+  after six minutes and 14 tool calls; the runner resumed the conversation on
+  `gemini-4-argon-medium`, which worked for 18 minutes and then reported
+  `API error: stream idle timeout (5m0s)` while still delivering the whole
+  review as text (no `structured_output` on an error result). 282k tokens
+  in all. The review was real: three policy findings, one a genuine
+  symlink-follow bypass (`ls -w1L` on BSD ls). So a result with an error
+  and a response is parsed as a review anyway.
+- In a Claude Code session that has another plugin's hooks active,
+  `CLAUDE_PLUGIN_DATA` can be set in the Bash tool's environment to that
+  plugin's data directory; the job state then lands there. Harmless, but
+  `/agy:status` from a plain terminal will not see those jobs.
+
 ## Alternative backend: the Antigravity Python SDK
 
 agy is closed source. `google-antigravity/antigravity-sdk-python` (Apache-2.0)

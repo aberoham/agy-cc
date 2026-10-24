@@ -88,9 +88,10 @@ class Program(NamedTuple):
 
 
 PROGRAMS = {
+    # ls -w and -T take a number on GNU but are flags on BSD, so `-w1L` would be
+    # -w -1 -L to BSD ls; both letters are left out rather than modelled.
     "ls": Program(
         frozenset("1AaBbCcdFfGghiklmnopqRrSstuUvxX%@"),
-        numeric=frozenset("wT"),  # GNU: line width and tab size; flags on BSD
         long=frozenset(
             {
                 "--all",
@@ -127,9 +128,11 @@ PROGRAMS = {
         frozenset("clmwL"), long=frozenset({"--bytes", "--chars", "--lines", "--words", "--max-line-length"})
     ),
     "pwd": Program(frozenset("LP")),
+    # stat -f and -t take a format on BSD but are flags on GNU, so `-tL` would be
+    # -t -L to GNU stat; only -c, a format on GNU and unknown to BSD, is listed.
     "stat": Program(
         frozenset("Flnqrsx"),
-        free=frozenset("cft"),  # format strings
+        free=frozenset("c"),
         long=frozenset({"--terse", "--file-system"}),
         long_value=frozenset({"--format", "--printf"}),
     ),
@@ -274,9 +277,9 @@ def parse_command(command: str) -> Parsed | None:
         if word == "--":
             operands += words[index + 1 :]
             break
-        if word.startswith("="):
-            return None  # zsh expands =name to a program's path
-        if word.startswith("-") and word != "-":
+        if word.startswith("=") or word == "-":
+            return None  # zsh expands =name to a program's path; `-` reads stdin, which never closes
+        if word.startswith("-"):
             if operands:
                 return None  # BSD programs would open a later dash word as a file
             options.append(word)
@@ -340,7 +343,33 @@ def _options_allowed(parsed: Parsed) -> bool:
     if parsed.program in ("echo", "find"):  # find was vetted while parsing
         return True
     spec = PROGRAMS.get(parsed.program)
-    return spec is not None and all(_option_allowed(spec, word) for word in parsed.options)
+    if spec is None or not all(_option_allowed(spec, word) for word in parsed.options):
+        return False
+    return not _reads_stdin(parsed)
+
+
+def _reads_stdin(parsed: Parsed) -> bool:
+    """True when the program would wait on standard input, which agy's pseudo-terminal never closes.
+
+    cat, head, tail, wc and stat read stdin with no file operand. grep does so
+    with no file operand: its first operand is the pattern unless one came
+    through -e or --regexp, and a recursive search without a path searches
+    cwd. A count given as the next word (head -n 5) is an operand to the
+    policy but is consumed by the program, so it does not count as a file.
+    """
+    if parsed.program in ("ls", "pwd"):
+        return False
+    spec = PROGRAMS[parsed.program]
+    consumed = sum(1 for o in parsed.options if not o.startswith("--") and o[-1] in spec.numeric)
+    files = len(parsed.operands) - consumed
+    if parsed.program != "grep":
+        return files < 1
+    options = parsed.options
+    recursive = any(o == "--recursive" or (not o.startswith("--") and "r" in o) for o in options)
+    if recursive:
+        return False
+    pattern_given = any(o.startswith("--regexp=") or (not o.startswith("--") and "e" in o) for o in options)
+    return files < (1 if pattern_given else 2)
 
 
 def _option_allowed(spec: Program, token: str) -> bool:
@@ -372,10 +401,17 @@ def _option_allowed(spec: Program, token: str) -> bool:
     return True
 
 
+COUNT_UNITS = set("bkKmMgG")
+
+
 def _is_count(value: str) -> bool:
-    """A count as head, tail and grep accept it: digits, optional sign, optional unit (-n+20, -c1K)."""
+    """A count as head, tail and grep accept it: digits, optional sign, optional unit (-n+20, -c1K).
+
+    Only the units head and tail define are accepted, so a trailing letter
+    cannot be a smuggled flag such as the L of `-w1L`.
+    """
     body = value.lstrip("+-")
-    if body[-1:].isalpha():
+    if body[-1:] in COUNT_UNITS:
         body = body[:-1]
     return body.isdigit()
 
@@ -402,8 +438,12 @@ def is_read_only_command(command: str) -> bool:
 
 
 def command_paths_inside(command: str, cwd: str, roots: list[str]) -> bool:
+    """True when the command's options are allowed and its operands stay inside roots.
+
+    Both checks run, so a path attached to an option (-f/etc/x) fails here too.
+    """
     parsed = parse_command(command)
-    return parsed is not None and _operands_inside(parsed, cwd, roots)
+    return parsed is not None and _options_allowed(parsed) and _operands_inside(parsed, cwd, roots)
 
 
 def decide(payload: dict[str, Any], policy: dict[str, Any]) -> Decision:

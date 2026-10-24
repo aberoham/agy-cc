@@ -376,7 +376,9 @@ class JobRunner:
             error = result.get("error") or f"agy finished with status {result.get('status')}"
 
         kind = self.job["kind"]
-        if kind in ("review", "adversarial-review") and error is None:
+        # agy can report an error (a stream idle timeout, seen live) and still
+        # deliver the whole reply, so a review is parsed whenever there is one.
+        if kind in ("review", "adversarial-review") and (error is None or response):
             schema = read_json(Path(self.job["json_schema"]), {}) if self.job.get("json_schema") else {}
             stored["review"], stored["parse_error"] = _parse_review(result, schema)
         if kind == "plan" and self.plan_paths:

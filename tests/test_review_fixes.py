@@ -126,6 +126,27 @@ def test_export_excludes_the_agents_directory_in_any_case(repo, tmp_path):
         'grep "$(id)" input',
         'grep "TODO: $" input',
         "cat =sh",
+        "ls -R -w1L .",
+        "ls -Rw1L .",
+        "ls -RT1L .",
+        "ls -w80 .",
+        "ls -w80 -T4 .",
+        "ls -w 80 .",
+        "grep --max-count=3 input",
+        "grep -A 3 input",
+        "head -c 10",
+        "stat -tL input",
+        "stat -fL input",
+        "head -c1L input",
+        "cat",
+        "cat -",
+        "cat - a.txt",
+        "wc -l",
+        "head -n 5",
+        "grep foo",
+        "grep -efoo",
+        "grep -n foo",
+        "stat",
         "head -c4 =sh",
         "find =x -name y",
         "find . ^input",
@@ -177,7 +198,7 @@ def test_options_that_read_elsewhere_need_claude(command):
         "grep --color=always key .",
         "grep --context=2 key .",
         "grep --color key .",
-        "grep --max-count=3 input",
+        "grep --max-count=3 key input",
         "grep -P 'key(s)?' input",
         "grep -E 'foo(bar)' input",
         'grep -rn "TODO: fix" src',
@@ -190,12 +211,18 @@ def test_options_that_read_elsewhere_need_claude(command):
         "grep -3 key .",
         "head -n 5 a.txt",
         "find -E . -regex x",
-        "ls -w80 -T4 .",
-        "ls -w 80 .",
         "head -5 a.txt",
         "tail -n 20 a.txt",
         "ls -la",
-        "cat - a.txt",
+        "grep -r foo",
+        "grep -rn foo",
+        "grep -efoo input",
+        "grep --regexp=foo input",
+        "grep foo input",
+        "wc -l input",
+        "stat -c%s input",
+        "pwd",
+        "head -c1K input",
     ],
 )
 def test_plain_options_stay_read_only(command):
@@ -239,7 +266,7 @@ def test_separate_words_are_path_checked_whatever_the_program_makes_of_them(tmp_
         "grep -A 3 key input",
     ):
         assert decision(command) == "deny", command
-    for command in ("head -n 5 input", "grep -A 5 key input", "ls -T 5", "grep -A5 key input"):
+    for command in ("head -n 5 input", "grep -A 5 key input", "grep -A5 key input", "cat 5"):
         assert decision(command) == "allow", command
 
 
@@ -452,6 +479,14 @@ def test_empty_structured_output_is_kept_as_the_raw_reply(companion):
     proc = companion.run("review", NO_SANDBOX, scenario="review-empty-structured", check=False)
     assert "does not match the schema" in proc.stdout
     assert "{}" in proc.stdout
+
+
+def test_review_delivered_with_an_error_is_still_parsed(companion):
+    """Seen live: agy reported a stream idle timeout and still returned the whole review."""
+    proc = companion.run("review", NO_SANDBOX, scenario="review-error-with-response", check=False)
+    assert proc.returncode == 1
+    assert "Error: API error: stream idle timeout" in proc.stdout
+    assert "Verdict: needs-attention" in proc.stdout and "Late but whole." in proc.stdout
 
 
 def test_well_formed_review_is_accepted():
