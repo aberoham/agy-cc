@@ -27,6 +27,11 @@ EOF
 settings_dir="${home}/.gemini/antigravity-cli"
 mkdir -p "${settings_dir}"
 
+# Remove the old sign-in so agy always shows the full flow, including the
+# licence choice. With the old token in place agy starts signed in, even
+# when Google has reclaimed the licence that sign-in chose.
+rm -f "${settings_dir}/antigravity-oauth-token"
+
 # Copy only the Google Cloud project and location from the host settings, so
 # the container uses the same Gemini Enterprise project without a hard-coded
 # name. agy's own terminal sandbox needs user namespaces, which Docker's

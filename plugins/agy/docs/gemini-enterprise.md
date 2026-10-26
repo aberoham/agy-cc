@@ -111,6 +111,19 @@ Placeholders are in capitals.
   and a container process not loading the token file
   ([issue 479](https://github.com/google-antigravity/antigravity-cli/issues/479)).
   A failed job shows agy's last error lines; sign in again and resume.
+- **A reclaimed seat looks like an unknown model.** When the organisation
+  takes back the seat a saved sign-in chose, agy's model-list request
+  returns `403 PERMISSION_DENIED` with reason
+  `GEMINI_ENTERPRISE_LICENSE_NOT_VALID`, and agy then rejects every model
+  name as unknown. The reason is only in agy's log (observed, 26 October
+  2026). The plugin reads the job's log and reports a failed job as a
+  licence problem. To fix it, sign out and in again: in host mode, run
+  `agy`, type `/logout`, then sign in again and choose a valid licence
+  (agy's changelog names `/logout`; not yet tested here). In container
+  mode, run `containers/signin.sh`, which removes the old container
+  sign-in before it starts agy. Removing
+  `~/.gemini/antigravity-cli/antigravity-oauth-token` also signs the host
+  out when agy stores its token in that file.
 - **Some features are not offered to business accounts.** Auto mode is
   unavailable for business and enterprise accounts (Google docs,
   [modes](https://antigravity.google/docs/cli/modes/)). The plugin does not
