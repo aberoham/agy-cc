@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from agylib.runner import _tail
 from conftest import FAKE_AGY, git
 
 NO_SANDBOX = "--no-os-sandbox"
@@ -192,3 +194,21 @@ def test_relative_state_dir_is_made_absolute(companion, repo):
     jobs = list((repo.parent / "relative-state").glob("*/jobs/*/job.json"))
     assert len(jobs) == 1
     assert Path(json.loads(jobs[0].read_text())["worktree"]).is_absolute()
+
+
+def test_stderr_tail_refuses_links_and_pipes(tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not agy's output\n")
+    link = tmp_path / "linked.txt"
+    link.symlink_to(secret)
+    pipe = tmp_path / "pipe.txt"
+    os.mkfifo(pipe)
+    assert _tail(link) == ""
+    assert _tail(pipe) == ""  # returns at once rather than waiting for a writer
+
+
+def test_stderr_tail_reads_only_after_start(tmp_path):
+    path = tmp_path / "agy.stderr.txt"
+    path.write_text("earlier round\nthis round\n")
+    assert _tail(path, start=len("earlier round\n")) == "this round\n"
+    assert _tail(path, limit=6) == "round\n"

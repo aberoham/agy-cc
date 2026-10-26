@@ -27,6 +27,14 @@ EOF
 settings_dir="${home}/.gemini/antigravity-cli"
 mkdir -p "${settings_dir}"
 
+# This script replaces the settings and token in the container home, so it
+# must never be pointed at the host's own agy directory.
+host_dir="${HOME}/.gemini/antigravity-cli"
+if [[ -d "${host_dir}" && "$(cd "${settings_dir}" && pwd -P)" == "$(cd "${host_dir}" && pwd -P)" ]]; then
+    echo "The container home ${home} is the host's own home; set AGY_CONTAINER_HOME to another directory." >&2
+    exit 1
+fi
+
 # Remove the old sign-in so agy always shows the full flow, including the
 # licence choice. With the old token in place agy starts signed in, even
 # when Google has reclaimed the licence that sign-in chose.

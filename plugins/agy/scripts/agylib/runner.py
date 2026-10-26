@@ -542,7 +542,10 @@ class JobRunner:
         in_container = self.job.get("isolation") == "container"
         log_text, _ = _read_log_chunk(self.log_path, self.log_start)
         if LICENCE_NOT_VALID in log_text:
-            where = "Run containers/signin.sh in a terminal" if in_container else "Run `agy` in a terminal"
+            if in_container:
+                where = "Run containers/signin.sh in a terminal"
+            else:
+                where = "Run `agy` in a terminal, type /logout"
             return (
                 f"Google rejected agy's Gemini Enterprise licence ({LICENCE_NOT_VALID}), so agy "
                 f"could not list its models. {where}, sign in again and choose a valid licence, "
@@ -699,12 +702,13 @@ def _count_lines(path: Path) -> int:
 
 
 def _tail(path: Path, start: int = 0, limit: int = 2000) -> str:
-    """The last limit bytes of path that lie at or after start."""
-    try:
-        data = path.read_bytes()
-    except OSError:
+    """The last limit bytes of path that lie at or after start, read without following a link."""
+    fd = _open_regular(path)
+    if fd is None:
         return ""
-    return data[start:][-limit:].decode("utf-8", errors="replace")
+    with os.fdopen(fd, "rb") as handle:
+        handle.seek(max(start, os.fstat(handle.fileno()).st_size - limit))
+        return handle.read(limit).decode("utf-8", errors="replace")
 
 
 def _command_line(pid: int) -> str:
