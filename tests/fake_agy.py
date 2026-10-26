@@ -192,6 +192,20 @@ def main() -> int:
         sys.stderr.write("error: authentication required\n")
         return 1
 
+    if scenario == "licence":
+        # A reclaimed Gemini Enterprise seat, as agy 1.4.7 reports it: the
+        # reason only in the log, and a misleading model error as the result.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('        "reason": "GEMINI_ENTERPRISE_LICENSE_NOT_VALID",\n')
+        result(
+            "",
+            "",
+            status="ERROR",
+            error=f"invalid model selection: model {model} is not recognized as a known model",
+        )
+        return 1
+
     stall_models = os.environ.get("FAKE_AGY_STALL_MODEL", "gemini-4-argon-high").split(",")
     if scenario.startswith("stall") and model in stall_models:
         if scenario == "stall-usage":

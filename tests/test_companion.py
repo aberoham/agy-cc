@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from agylib.runner import _tail
 from conftest import FAKE_AGY, git
 
 NO_SANDBOX = "--no-os-sandbox"
@@ -131,6 +133,38 @@ def test_auth_failure_points_to_setup(companion):
     assert companion.job()["status"] == "failed"
 
 
+def test_invalid_licence_asks_for_a_new_sign_in(companion):
+    proc = companion.run("review", NO_SANDBOX, scenario="licence")
+    assert proc.returncode == 1
+    job = companion.job()
+    assert job["status"] == "failed"
+    assert "GEMINI_ENTERPRISE_LICENSE_NOT_VALID" in job["error"]
+    assert "Run `agy` in a terminal" in job["error"]
+
+
+def test_invalid_licence_in_a_container_points_to_signin_script(contained):
+    contained.run("review", scenario="licence")
+    job = contained.job()
+    assert "GEMINI_ENTERPRISE_LICENSE_NOT_VALID" in job["error"]
+    assert "containers/signin.sh" in job["error"]
+
+
+def test_licence_error_from_an_earlier_round_is_not_reused(companion):
+    companion.run("task", NO_SANDBOX, "fix it", scenario="licence")
+    companion.run("task", NO_SANDBOX, "--resume-last", "try again", scenario="auth")
+    job = companion.job()
+    assert "LICENSE_NOT_VALID" not in job["error"]
+    assert "not signed in" in job["error"]
+
+
+def test_sign_in_error_from_an_earlier_round_is_not_reused(companion):
+    companion.run("task", NO_SANDBOX, "fix it", scenario="auth")
+    companion.run("task", NO_SANDBOX, "--resume-last", "try again", scenario="review-error-with-response")
+    error = companion.job()["error"]
+    assert "not signed in" not in error
+    assert "stream idle timeout" in error
+
+
 def test_setup_reports_fake_agy(companion):
     proc = companion.run("setup", "--json")
     report = json.loads(proc.stdout)
@@ -160,3 +194,21 @@ def test_relative_state_dir_is_made_absolute(companion, repo):
     jobs = list((repo.parent / "relative-state").glob("*/jobs/*/job.json"))
     assert len(jobs) == 1
     assert Path(json.loads(jobs[0].read_text())["worktree"]).is_absolute()
+
+
+def test_stderr_tail_refuses_links_and_pipes(tmp_path):
+    secret = tmp_path / "secret.txt"
+    secret.write_text("not agy's output\n")
+    link = tmp_path / "linked.txt"
+    link.symlink_to(secret)
+    pipe = tmp_path / "pipe.txt"
+    os.mkfifo(pipe)
+    assert _tail(link) == ""
+    assert _tail(pipe) == ""  # returns at once rather than waiting for a writer
+
+
+def test_stderr_tail_reads_only_after_start(tmp_path):
+    path = tmp_path / "agy.stderr.txt"
+    path.write_text("earlier round\nthis round\n")
+    assert _tail(path, start=len("earlier round\n")) == "this round\n"
+    assert _tail(path, limit=6) == "round\n"

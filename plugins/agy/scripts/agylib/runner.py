@@ -34,6 +34,10 @@ DEFAULT_MAX_MINUTES = 60
 PROGRESS_WRITE_INTERVAL = 1.0
 PERMISSION_DENIED = re.compile(r'permission check failed for command "(.*)": ', re.S)
 AUTH_HINTS = ("authentication required", "authentication timed out", "not signed in")
+# When Google reclaims the Gemini Enterprise seat behind a saved sign-in,
+# agy cannot list its models and rejects every model name as unknown. The
+# reason appears only in agy's log, as this error code on a 403 response.
+LICENCE_NOT_VALID = "GEMINI_ENTERPRISE_LICENSE_NOT_VALID"
 
 CONTINUE_AFTER_STALL = (
     "Your previous attempt stopped because the model stream stalled. Continue the same "
@@ -217,6 +221,13 @@ def _read_log_chunk(log_path: Path, offset: int) -> tuple[str, int]:
         return chunk, log.tell()
 
 
+def _file_size(path: Path) -> int:
+    try:
+        return path.lstat().st_size
+    except OSError:
+        return 0
+
+
 class JobRunner:
     """Runs a job's pending turn, then resumes after stalls until it finishes."""
 
@@ -229,6 +240,9 @@ class JobRunner:
         self.plan_paths: list[str] = []
         self.denied_commands: list[str] = []
         self.step_usage: dict[str, int] = {}
+        self.stderr_path = self.dir / "agy.stderr.txt"
+        self.log_start = 0
+        self.stderr_start = 0
         self._last_write = 0.0
 
     # Event handling -------------------------------------------------------
@@ -373,6 +387,9 @@ class JobRunner:
         usage_total: dict[str, int] = {}
         if self.job.get("isolation") == "container":
             container.seed_home(self.dir)  # a fresh home for this round, from the sign-in
+        # Both files are appended to across rounds; earlier rounds' errors are not this round's.
+        self.log_start = _file_size(self.log_path)
+        self.stderr_start = _file_size(self.stderr_path)
 
         while True:
             self.step_usage = {}
@@ -382,7 +399,7 @@ class JobRunner:
                 message=message,
                 events_path=self.dir / "events.ndjson",
                 log_path=self.log_path,
-                stderr_path=self.dir / "agy.stderr.txt",
+                stderr_path=self.stderr_path,
                 stall_seconds=stall_seconds,
                 deadline=deadline,
                 on_event=self.on_event,
@@ -447,17 +464,14 @@ class JobRunner:
             "queued_commands": commands,
         }
         error = None
+        stderr_tail = _tail(self.stderr_path, self.stderr_start)
         if outcome.kind != "result":
             error = outcome.detail
-            stderr_tail = _tail(self.dir / "agy.stderr.txt")
-            if any(hint in stderr_tail.lower() for hint in AUTH_HINTS):
-                if self.job.get("isolation") == "container":
-                    error = "agy is not signed in for containers. Run containers/signin.sh in a terminal."
-                else:
-                    error = "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
             stored["stderr_tail"] = stderr_tail
         elif result.get("status") != "SUCCESS":
             error = result.get("error") or f"agy finished with status {result.get('status')}"
+        if error is not None:
+            error = self._signin_problem(stderr_tail) or error
 
         kind = self.job["kind"]
         # agy can report an error (a stream idle timeout, seen live) and still
@@ -522,6 +536,26 @@ class JobRunner:
         if self.job.get("kind") != "task" and record.get("status") in ("completed", "failed", "cancelled"):
             gitctx.remove_worktree(self.job["repo_root"], Path(self.job["worktree"]))
         return record
+
+    def _signin_problem(self, stderr_tail: str) -> str | None:
+        """What to tell the user when this round failed for lack of a sign-in or a valid seat."""
+        in_container = self.job.get("isolation") == "container"
+        log_text, _ = _read_log_chunk(self.log_path, self.log_start)
+        if LICENCE_NOT_VALID in log_text:
+            if in_container:
+                where = "Run containers/signin.sh in a terminal"
+            else:
+                where = "Run `agy` in a terminal, type /logout"
+            return (
+                f"Google rejected agy's Gemini Enterprise licence ({LICENCE_NOT_VALID}), so agy "
+                f"could not list its models. {where}, sign in again and choose a valid licence, "
+                "then resume this job."
+            )
+        if any(hint in stderr_tail.lower() for hint in AUTH_HINTS):
+            if in_container:
+                return "agy is not signed in for containers. Run containers/signin.sh in a terminal."
+            return "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
+        return None
 
     def _read_plan(self, path: Path) -> str | None:
         """The plan artifact's text, or None unless the file really sits under the brain directory.
@@ -667,12 +701,14 @@ def _count_lines(path: Path) -> int:
     return len(_read_lines(path))
 
 
-def _tail(path: Path, limit: int = 2000) -> str:
-    try:
-        data = path.read_bytes()
-    except OSError:
+def _tail(path: Path, start: int = 0, limit: int = 2000) -> str:
+    """The last limit bytes of path that lie at or after start, read without following a link."""
+    fd = _open_regular(path)
+    if fd is None:
         return ""
-    return data[-limit:].decode("utf-8", errors="replace")
+    with os.fdopen(fd, "rb") as handle:
+        handle.seek(max(start, os.fstat(handle.fileno()).st_size - limit))
+        return handle.read(limit).decode("utf-8", errors="replace")
 
 
 def _command_line(pid: int) -> str:
