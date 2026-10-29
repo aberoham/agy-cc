@@ -57,9 +57,10 @@ Placeholders are in capitals.
   the saved sign-in; without one it exits with `authentication required`
   (observed; [headless docs](https://antigravity.google/docs/cli/headless/)).
   The plugin cannot sign in for you: run `agy` in a terminal window.
-- **The flow:** Business account → Continue with Google Cloud. With workforce
-  identity federation (sign-in through your own identity provider), choose
-  Advanced WIF Configuration and enter
+- **The flow:** Business account, then one of two alternatives. Continue with
+  Google Cloud signs in with a Google account. With workforce identity
+  federation (sign-in through your own identity provider), choose Advanced
+  WIF Configuration instead and enter
   `locations/global/workforcePools/POOL_ID/providers/PROVIDER_ID` (Google
   docs, [enterprise](https://antigravity.google/docs/enterprise/)). The labels
   have changed between releases: older versions said "Use advanced SSO

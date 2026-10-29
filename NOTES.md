@@ -8,6 +8,22 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
 - `/usr/local/bin/agy` is a Jamf-installed Bash wrapper around
   `~/.local/share/agy/agy`. If the OAuth token file is missing, it puts the
   organisation's workforce sign-in provider string on the clipboard and prints a hint.
+- `agy models` tells a working sign-in from a broken one without sending a
+  prompt (observed 29 October 2026, agy 1.4.7, in the container). A valid
+  token lists the models after `Fetching available models...`, in about two
+  seconds. A missing token, or one whose access and refresh tokens are
+  corrupted, gets `Error: Please sign in to view available models.` Either way
+  agy exits 0. The list comes from a server request: with a reclaimed licence
+  that request returns `403 PERMISSION_DENIED`
+  (`GEMINI_ENTERPRISE_LICENSE_NOT_VALID`, see
+  `plugins/agy/docs/gemini-enterprise.md`). `containers/signin.sh` uses it as
+  the post-sign-in check and requires the Gemini 4 Argon models in the list.
+- The token file records how agy signed in, beside the credential:
+  `auth_method`, `user_tier` (`gcp-ge-plus-tier` here), `project_id`,
+  `region` and `wif_provider` (observed 29 October 2026, agy 1.4.7).
+  `containers/signin.sh` prints all but `wif_provider`. When it knows the
+  expected workforce provider, it fails if `wif_provider` differs and names
+  both.
 - `-p` takes the next argument as the prompt, so `-p --model x` fails. agy
   says so: `-p took "--input-format" as its prompt`.
 - Prompts can be sent on stdin without shell quoting:
