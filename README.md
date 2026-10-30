@@ -5,6 +5,7 @@ and rescue tasks to Google's Antigravity CLI (`agy`, Gemini 4 Argon) as
 tracked, isolated background jobs.
 
 - The plugin is in [`plugins/agy`](plugins/agy); its [README](plugins/agy/README.md) covers prerequisites, install, commands and gotchas.
+- Install it with `/plugin marketplace add aberoham/agy-cc`, then `/plugin install agy@agy-cc`.
 - [`NOTES.md`](NOTES.md) records how agy 1.4.7 was observed to behave, and the open questions.
 - [`containers/`](containers) holds the image and the sign-in script for container isolation. Its design follows Matt Pocock's [Sandcastle](https://github.com/mattpocock/sandcastle).
 

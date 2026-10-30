@@ -27,11 +27,20 @@ works on its own copy of your repository, so agy never edits your checkout.
 
 ## Install
 
-From a marketplace that lists this plugin:
+This repository is its own marketplace. Add it, then install the plugin:
+
+```
+/plugin marketplace add aberoham/agy-cc
+/plugin install agy@agy-cc
+```
+
+From another marketplace that lists this plugin:
 
 ```
 /plugin install agy@<marketplace>
 ```
+
+To update later: `/plugin marketplace update agy-cc`.
 
 To try a local checkout: `claude --plugin-dir plugins/agy`.
 
