@@ -244,13 +244,14 @@ def test_setup_shows_an_unknown_sign_in_without_telling_the_user_to_sign_in(comp
     agy = tmp_path / "agy"
     agy.write_text(
         "#!/bin/sh\n"
-        "[ \"$1\" = models ] && { echo 'Error: quota service unavailable'; exit 0; }\n"
+        "[ \"$1\" = models ] && { echo 'Error: quota service unavailable.'; exit 0; }\n"
         f'exec {sys.executable} {FAKE_AGY} "$@"\n'
     )
     agy.chmod(0o755)
     proc = companion.run("setup", AGY_BIN=str(agy))
     assert "Signed in: unknown" in proc.stdout
     assert "Could not confirm agy's sign-in: Error: quota service unavailable." in proc.stdout
+    assert "unavailable.." not in proc.stdout
     assert "not signed in" not in proc.stdout
 
 

@@ -121,7 +121,7 @@ def setup_report() -> dict[str, Any]:
     if binary and signed_in is False:
         problems.append("agy is not signed in. Run `agy` once in a terminal and sign in.")
     elif binary and signed_in is None:
-        problems.append(f"Could not confirm agy's sign-in: {detail}.")
+        problems.append(f"Could not confirm agy's sign-in: {detail.rstrip('.')}.")
     if binary and not report["gcp_project"]:
         problems.append("agy has no Google Cloud project set; choose one when you sign in.")
     report["ready"] = not problems
