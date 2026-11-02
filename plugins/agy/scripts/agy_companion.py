@@ -99,7 +99,6 @@ def setup_report() -> dict[str, Any]:
         "agy_version": ".".join(map(str, version)) if version else None,
         "version_ok": bool(version and version >= agybin.MIN_VERSION),
         "minimum_version": ".".join(map(str, agybin.MIN_VERSION)),
-        "signed_in": agybin.token_present(),
         "gcp_project": gcp.get("project"),
         "gcp_location": gcp.get("location"),
         "permission_allow_rules": len((settings.get("permissions") or {}).get("allow") or []),
@@ -107,6 +106,10 @@ def setup_report() -> dict[str, Any]:
         "python": sys.version.split()[0],
         "default_model": agybin.DEFAULT_MODEL,
     }
+    signed_in, detail = agybin.sign_in_check(binary) if binary else (None, "agy not found")
+    report["signed_in"] = signed_in
+    report["sign_in_detail"] = detail
+    report["token_file"] = agybin.token_present()
     report.update(container.report())
     report["container_unavailable"] = container.unavailable_reason(report)
     report["isolation"] = "host" if report["container_unavailable"] else "container"
@@ -115,13 +118,25 @@ def setup_report() -> dict[str, Any]:
         problems.append("agy is not installed or not on PATH. Install it, or set AGY_BIN to its path.")
     elif not report["version_ok"]:
         problems.append(f"agy {report['agy_version']} is older than {report['minimum_version']}; run `agy update`.")
-    if binary and not report["signed_in"]:
-        problems.append("agy has no saved sign-in. Run `agy` once in a terminal and sign in.")
+    if binary and signed_in is False:
+        problems.append("agy is not signed in. Run `agy` once in a terminal and sign in.")
+    elif binary and signed_in is None:
+        problems.append(f"Could not confirm agy's sign-in: {detail}.")
     if binary and not report["gcp_project"]:
         problems.append("agy has no Google Cloud project set; choose one when you sign in.")
     report["ready"] = not problems
     report["problems"] = problems
     return report
+
+
+def sign_in_label(report: dict[str, Any]) -> str:
+    if report["signed_in"] is None:
+        return "unknown"
+    if not report["signed_in"]:
+        return "no"
+    if report["token_file"]:
+        return "yes (token file)"
+    return "yes (not in the token file; agy keeps it elsewhere, such as the keychain)"
 
 
 def cmd_setup(args: argparse.Namespace) -> int:
@@ -130,7 +145,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         emit(report, True)
         return 0
     lines = [f"agy: {report['agy_path'] or 'not found'} (version {report['agy_version'] or '-'})"]
-    lines.append(f"Signed in: {'yes' if report['signed_in'] else 'no'}")
+    lines.append(f"Signed in: {sign_in_label(report)}")
     lines.append(f"Google Cloud project: {report['gcp_project'] or '-'} ({report['gcp_location'] or '-'})")
     lines.append(f"macOS write sandbox: {'available' if report['os_sandbox'] else 'not available'}")
     lines.append(f"Default model: {report['default_model']}")

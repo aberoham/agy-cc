@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from agylib import agybin
 from agylib.runner import _tail
 from conftest import FAKE_AGY, git
 
@@ -169,8 +170,88 @@ def test_setup_reports_fake_agy(companion):
     proc = companion.run("setup", "--json")
     report = json.loads(proc.stdout)
     assert report["agy_version"] == "1.4.7"
+    assert report["signed_in"] is True
+    assert report["token_file"] is False
+
+
+def test_setup_counts_a_sign_in_kept_outside_the_token_file(companion):
+    proc = companion.run("setup")
+    assert "Signed in: yes (not in the token file" in proc.stdout
+    assert "not signed in" not in proc.stdout
+
+
+def test_setup_reports_signed_out_when_agy_asks_for_a_sign_in(companion):
+    proc = companion.run("setup", "--json", scenario="auth")
+    report = json.loads(proc.stdout)
     assert report["signed_in"] is False
     assert report["ready"] is False
+    assert any("not signed in" in p for p in report["problems"])
+
+
+def test_sign_in_check_is_unknown_when_agy_lists_nothing(tmp_path):
+    silent = tmp_path / "agy"
+    silent.write_text("#!/bin/sh\necho 'Fetching available models...'\n")
+    silent.chmod(0o755)
+    signed_in, detail = agybin.sign_in_check(silent)
+    assert signed_in is None
+    assert "printed no models" in detail
+
+
+def test_sign_in_check_reports_another_error_as_unknown(tmp_path):
+    failing = tmp_path / "agy"
+    failing.write_text("#!/bin/sh\necho 'Error: PERMISSION_DENIED (code 403)'\n")
+    failing.chmod(0o755)
+    signed_in, detail = agybin.sign_in_check(failing)
+    assert signed_in is None
+    assert detail == "Error: PERMISSION_DENIED (code 403)"
+
+
+@pytest.mark.parametrize(
+    ("script", "detail"),
+    [
+        ("echo 'gemini-client: request failed'", "gemini-client: request failed"),
+        (
+            "printf 'gemini-4-argon-low\\tGemini 4 Argon (Low)\\n'; echo 'PERMISSION_DENIED' >&2; exit 1",
+            "PERMISSION_DENIED",
+        ),
+        ("printf 'gemini-4-argon-low\\tGemini 4 Argon (Low)\\n'; exit 1", "`agy models` printed no models (exit 1)"),
+        ("echo '403 PERMISSION_DENIED: licence revoked'", "403 PERMISSION_DENIED: licence revoked"),
+    ],
+)
+def test_sign_in_check_never_says_yes_on_a_failure(tmp_path, script, detail):
+    agy = tmp_path / "agy"
+    agy.write_text(f"#!/bin/sh\n{script}\n")
+    agy.chmod(0o755)
+    assert agybin.sign_in_check(agy) == (None, detail)
+
+
+def test_sign_in_check_survives_output_that_is_not_utf8(tmp_path):
+    agy = tmp_path / "agy"
+    agy.write_text("#!/bin/sh\nprintf 'Error: \\377\\376\\n'\n")
+    agy.chmod(0o755)
+    signed_in, detail = agybin.sign_in_check(agy)
+    assert signed_in is None
+    assert detail.startswith("Error:")
+
+
+def test_sign_in_check_reports_an_agy_that_cannot_run(tmp_path):
+    signed_in, detail = agybin.sign_in_check(tmp_path / "missing")
+    assert signed_in is None
+    assert "could not run" in detail
+
+
+def test_setup_shows_an_unknown_sign_in_without_telling_the_user_to_sign_in(companion, tmp_path):
+    agy = tmp_path / "agy"
+    agy.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = models ] && { echo 'Error: quota service unavailable'; exit 0; }\n"
+        f'exec {sys.executable} {FAKE_AGY} "$@"\n'
+    )
+    agy.chmod(0o755)
+    proc = companion.run("setup", AGY_BIN=str(agy))
+    assert "Signed in: unknown" in proc.stdout
+    assert "Could not confirm agy's sign-in: Error: quota service unavailable." in proc.stdout
+    assert "not signed in" not in proc.stdout
 
 
 def test_fake_agy_rejects_p_followed_by_a_flag():
