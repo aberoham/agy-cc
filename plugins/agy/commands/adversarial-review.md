@@ -29,6 +29,6 @@ Then follow the `agy-result-handling` skill: present the findings, verifying agy
 
 Background:
 ```typescript
-Bash({ command: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py" adversarial-review --background --raw "$ARGUMENTS"`, description: "agy adversarial review", run_in_background: false })
+Bash({ command: `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/agy_companion.py" adversarial-review --wait --wait-seconds 3600 --raw "<ARGUMENTS without --background>"`, description: "agy adversarial review", run_in_background: true })
 ```
-The companion starts the job and returns at once with its id. Tell the user: "agy adversarial review started as <job id>. Check `/agy:status` for progress."
+Remove `--background` from the arguments before passing them (the companion would otherwise detach and return at once). Claude Code keeps the companion running as a background shell, so the user can watch it in the shell details view, and you are notified when it exits. Do not poll the output file. Tell the user: "agy adversarial review started in the background. Check `/agy:status` for progress." When the notification arrives, read the output file and follow the `agy-result-handling` skill.
