@@ -134,6 +134,47 @@ def read_settings() -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+# One row of `agy models`: the model id, a tab, then its display name.
+MODEL_ROW = re.compile(r"^gemini-[\w.-]+\t\S")
+
+
 def token_present() -> bool:
     token = agy_home() / "antigravity-oauth-token"
     return token.is_file() and token.stat().st_size > 0
+
+
+def sign_in_check(binary: Path) -> tuple[bool | None, str]:
+    """Ask agy itself whether it is signed in, by listing models.
+
+    agy may keep its sign-in in the token file or in the operating system's
+    keychain, so the file alone does not decide it. Listing models sends no
+    prompt and needs a sign-in the server accepts. agy exits 0 even when it
+    refuses, so the output decides: model rows with no other output and a
+    zero exit mean signed in, a request to sign in means not, and anything
+    else (a timeout, a licence error) is unknown, with agy's message as the
+    detail.
+    """
+    try:
+        proc = subprocess.run(
+            [str(binary), "models"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            errors="replace",
+            timeout=30,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "`agy models` did not answer within 30 seconds"
+    except OSError as exc:
+        return None, f"could not run `agy models`: {exc}"
+    lines = [line.strip() for line in (proc.stdout + proc.stderr).splitlines()]
+    lines = [line for line in lines if line and line != "Fetching available models..."]
+    rows = [line for line in lines if MODEL_ROW.match(line)]
+    other = [line for line in lines if not MODEL_ROW.match(line)]
+    if any("please sign in" in line.lower() for line in other):
+        return False, next(line for line in other if "please sign in" in line.lower())
+    if rows and not other and proc.returncode == 0:
+        return True, "agy listed its models"
+    if other:
+        return None, other[0][:200]
+    return None, f"`agy models` printed no models (exit {proc.returncode})"

@@ -129,6 +129,14 @@ def main() -> int:
     if argv == ["--version"]:
         print("1.4.7")
         return 0
+    if argv == ["models"]:
+        # agy 1.4.7 prints an error and still exits 0 when it is not signed in.
+        print("Fetching available models...")
+        if os.environ.get("FAKE_AGY_SCENARIO") == "auth":
+            print("Error: Please sign in to view available models. Launch the CLI without arguments to sign in.")
+        else:
+            print("gemini-4-argon-high\tGemini 4 Argon (High)\ngemini-4-argon-low\tGemini 4 Argon (Low)")
+        return 0
     check_print_flag(argv)
     stdin = sys.stdin.read()
     if calls:
