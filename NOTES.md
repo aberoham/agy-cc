@@ -199,6 +199,20 @@ on 24 October 2026 with agy 1.4.7, unless marked otherwise.
   background plan was starting; host mode passed review, adversarial review
   and plan, and its task, apply and cancel steps hit the same expiry. Rerun
   both smokes after signing in again before relying on them.
+- **Container jobs reuse the host sign-in** (7 November 2026, after Abe
+  asked why he signs in twice every morning). Nothing recorded required a
+  separate container sign-in: the first live container runs used a copy of
+  the host token, and the long-lived-secret worry was settled by the
+  eight-hour pool session. A copy of that morning's host token (written by
+  the managed agy wrapper to
+  `~/.gemini/antigravity-cli/antigravity-oauth-token`, `auth_method: gcp`,
+  `user_tier: gcp-ge-plus-tier`) in a fresh container listed the Gemini 4
+  Argon models, and agy left the copy unchanged. Each round now copies the
+  newer of the host token and the `containers/signin.sh` token, with
+  settings reduced to the host's `gcp` block and `enableTerminalSandbox:
+  false`. `AGY_SMOKE_ISOLATION=container scripts/live-smoke.sh --apply`
+  then passed every step (agy 1.5.2, `gemini-4-argon-low`) with no
+  container-only token present at all.
 
 - Image tooling (24 October 2026, after Abe asked for Sandcastle's lessons):
   the image gained `uv` and `jq` and a numeric `USER`, and the companion a

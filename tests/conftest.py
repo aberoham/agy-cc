@@ -66,7 +66,7 @@ class Companion:
         if container_mode:
             token = tmp / "container-home" / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             token.parent.mkdir(parents=True, exist_ok=True)
-            token.write_text("{}")
+            token.write_text('{"token": "fake"}')
 
     def run(self, *args: str, scenario: str = "reply", check: bool = True, **env: str) -> subprocess.CompletedProcess:
         proc = subprocess.run(
@@ -77,7 +77,11 @@ class Companion:
             text=True,
             timeout=120,
         )
-        if check and proc.returncode not in (0, 1):
+        # A failed job exits with its failure class's code; anything else
+        # (a usage error, a traceback's 1 with no job) is a test failure.
+        from agylib import failure
+
+        if check and proc.returncode != 0 and proc.returncode not in failure.EXIT_CODES.values():
             raise AssertionError(f"companion failed ({proc.returncode}): {proc.stdout}\n{proc.stderr}")
         return proc
 
@@ -119,3 +123,19 @@ def companion(repo: Path, tmp_path: Path) -> Companion:
 @pytest.fixture
 def contained(repo: Path, tmp_path: Path) -> Companion:
     return Companion(repo, tmp_path, container_mode=True)
+
+
+@pytest.fixture
+def companion_module(companion: Companion, monkeypatch: pytest.MonkeyPatch):
+    """The companion script imported into the test process, with the companion fixture's
+    environment and the repository as the working directory, so a test can patch it."""
+    import importlib.util
+
+    for name in ("HOME", "PATH", "AGY_BIN", "AGY_COMPANION_STATE_DIR", "AGY_CONTAINER_HOME"):
+        monkeypatch.setenv(name, companion.env[name])
+    monkeypatch.chdir(companion.repo)
+    spec = importlib.util.spec_from_file_location("agy_companion_under_test", COMPANION)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

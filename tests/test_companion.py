@@ -127,27 +127,27 @@ def test_background_then_cancel(companion):
     assert companion.job()["status"] == "cancelled"
 
 
-def test_auth_failure_points_to_setup(companion):
+def test_auth_failure_points_to_the_host_sign_in(companion):
     proc = companion.run("review", NO_SANDBOX, scenario="auth")
-    assert proc.returncode == 1
-    assert "/agy:setup" in proc.stdout
+    assert proc.returncode == 11
+    assert "Sign in with `agy` in a terminal" in proc.stdout
     assert companion.job()["status"] == "failed"
 
 
 def test_invalid_licence_asks_for_a_new_sign_in(companion):
     proc = companion.run("review", NO_SANDBOX, scenario="licence")
-    assert proc.returncode == 1
+    assert proc.returncode == 15
     job = companion.job()
     assert job["status"] == "failed"
     assert "GEMINI_ENTERPRISE_LICENSE_NOT_VALID" in job["error"]
     assert "Run `agy` in a terminal" in job["error"]
 
 
-def test_invalid_licence_in_a_container_points_to_signin_script(contained):
+def test_invalid_licence_in_a_container_points_to_the_host_sign_in(contained):
     contained.run("review", scenario="licence")
     job = contained.job()
     assert "GEMINI_ENTERPRISE_LICENSE_NOT_VALID" in job["error"]
-    assert "containers/signin.sh" in job["error"]
+    assert "Run `agy` in a terminal" in job["error"]
 
 
 def test_licence_error_from_an_earlier_round_is_not_reused(companion):

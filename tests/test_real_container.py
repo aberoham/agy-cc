@@ -41,6 +41,13 @@ def image() -> str:
         capture_output=True,
         timeout=600,
     )
+    # A changed fake_agy.py rebuilds the image and leaves the old one untagged.
+    subprocess.run(
+        ["docker", "image", "prune", "--force", "--filter", "label=agy-cc.image=test"],
+        check=True,
+        capture_output=True,
+        timeout=120,
+    )
     return IMAGE
 
 
@@ -62,7 +69,7 @@ def _job(scratch: Path) -> tuple[Path, dict]:
 def _companion(scratch: Path, cwd: Path, *args: str) -> subprocess.CompletedProcess:
     token = scratch / "container-home" / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
     token.parent.mkdir(parents=True, exist_ok=True)
-    token.write_text("{}")
+    token.write_text('{"token": "fake"}')
     env = dict(
         os.environ,
         AGY_BIN=str(TESTS / "fake_agy.py"),
