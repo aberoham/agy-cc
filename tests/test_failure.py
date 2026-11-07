@@ -67,19 +67,10 @@ def test_an_expired_session_fails_at_once_instead_of_waiting_for_the_stall_timer
     assert len(companion.agy_calls()) == 1
 
 
-def test_missing_agy_exits_13(companion, monkeypatch, capsys):
+def test_missing_agy_exits_13(companion_module, monkeypatch, capsys):
     # In-process, so no real agy elsewhere on this machine can be found and run.
-    import importlib.util
-
-    from conftest import COMPANION
-
-    spec = importlib.util.spec_from_file_location("agy_companion_under_test", COMPANION)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    monkeypatch.setattr(module.agybin, "find_agy", lambda: None)
-    monkeypatch.chdir(companion.repo)
-    assert module.main(["review", NO_SANDBOX]) == 13
+    monkeypatch.setattr(companion_module.agybin, "find_agy", lambda: None)
+    assert companion_module.main(["review", NO_SANDBOX]) == 13
     assert "not installed" in capsys.readouterr().err
 
 
@@ -118,3 +109,36 @@ def test_an_expired_session_ends_the_turn_even_while_agy_keeps_emitting_events(c
     proc = companion.run("review", NO_SANDBOX, scenario="session-expired-chatty", check=False)
     assert proc.returncode == 11
     assert time.monotonic() - started < 60
+
+
+def test_a_worker_crash_records_its_failure_class(companion, companion_module, repo, monkeypatch):
+    from agylib import state
+
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    state.JobStore(repo).update(job["id"], lambda r: r.update({"status": "queued"}))
+
+    def crash(self):
+        raise RuntimeError("Cannot connect to the Docker daemon at unix:///x/docker.sock")
+
+    monkeypatch.setattr(companion_module.JobRunner, "run", crash)
+    with pytest.raises(RuntimeError):
+        companion_module.main(["_worker", job["id"]])
+    job = companion.job()
+    assert job["status"] == "failed" and job["failure"] == "container"
+
+
+def test_a_failed_working_copy_preparation_records_its_failure_class(companion, companion_module, repo, monkeypatch):
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+
+    def refuse(*_args):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr(companion_module.gitctx, "install_hooks", refuse)
+    results = repo.parent / "results.md"
+    results.write_text("more\n")
+    with pytest.raises(OSError):
+        companion_module.main(["resume", job["id"], str(results), NO_SANDBOX])
+    job = companion.job()
+    assert job["status"] == "failed" and job["failure"] == "agy-failed"

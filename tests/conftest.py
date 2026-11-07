@@ -123,3 +123,19 @@ def companion(repo: Path, tmp_path: Path) -> Companion:
 @pytest.fixture
 def contained(repo: Path, tmp_path: Path) -> Companion:
     return Companion(repo, tmp_path, container_mode=True)
+
+
+@pytest.fixture
+def companion_module(companion: Companion, monkeypatch: pytest.MonkeyPatch):
+    """The companion script imported into the test process, with the companion fixture's
+    environment and the repository as the working directory, so a test can patch it."""
+    import importlib.util
+
+    for name in ("HOME", "PATH", "AGY_BIN", "AGY_COMPANION_STATE_DIR", "AGY_CONTAINER_HOME"):
+        monkeypatch.setenv(name, companion.env[name])
+    monkeypatch.chdir(companion.repo)
+    spec = importlib.util.spec_from_file_location("agy_companion_under_test", COMPANION)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module

@@ -7,6 +7,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -480,3 +481,56 @@ def test_resume_refuses_a_record_with_no_working_copy_recorded(companion, repo, 
     proc = companion.run("resume", job["id"], str(results), NO_SANDBOX, check=False)
     assert "working copy no longer exists" in proc.stdout + proc.stderr
     assert companion.job()["status"] == job["status"]
+
+
+def _in_thread(target) -> tuple[threading.Thread, list]:
+    outcome: list = []
+
+    def run() -> None:
+        try:
+            outcome.append(target())
+        except Exception as exc:  # noqa: BLE001 - the test inspects what the thread raised
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, outcome
+
+
+def test_expiry_waits_for_a_resume_holding_the_lock_and_then_spares_the_job(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    job_dir = state.JobStore(repo).job_dir(job["id"])
+    path = job_dir / "job.json"
+    with state.locked(path):  # a resume is part-way through marking the job queued
+        thread, outcome = _in_thread(lambda: state.drop_finished_working_copy(job_dir))
+        time.sleep(0.5)
+        assert thread.is_alive()  # waiting for the lock, not acting on a status read earlier
+        state.write_json(path, dict(json.loads(path.read_text()), status="queued"))
+    thread.join(10)
+    assert outcome == [False]
+    assert Path(job["worktree"]).is_dir()
+
+
+def test_a_resume_waiting_on_cleanup_sees_the_working_copy_is_gone(companion, companion_module, repo):
+    import argparse
+
+    from agylib import state
+
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    job_dir = store.job_dir(job["id"])
+    args = argparse.Namespace(model=None, background=True, wait=False)
+    with state.locked(job_dir / "job.json"):  # cleanup holds the lock
+        thread, outcome = _in_thread(lambda: companion_module.continue_job(store, job, "more", "approval-resume", args))
+        time.sleep(0.5)
+        assert thread.is_alive()
+        state.drop_working_copy(job, job_dir)
+    thread.join(10)
+    assert len(outcome) == 1 and isinstance(outcome[0], companion_module.UsageError)
+    assert "working copy no longer exists" in str(outcome[0])
+    assert companion.job()["status"] == job["status"]  # unchanged: the resume never queued it
