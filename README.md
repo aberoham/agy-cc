@@ -3,6 +3,9 @@
 Run Google's Antigravity CLI from Claude Code inside a container, never with
 `--yolo` on your workstation.
 
+Without Docker or Colima, jobs fall back to host mode: a git worktree, a hook
+policy on every tool call and macOS `sandbox-exec`, still without `--yolo`.
+
 A Claude Code plugin that hands code review, adversarial review, plan writing
 and rescue tasks to Google's Antigravity CLI (`agy`, Gemini 4 Argon) as
 tracked, isolated background jobs.
