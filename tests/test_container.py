@@ -32,7 +32,7 @@ def test_without_docker_jobs_fall_back_to_host_mode(companion):
 
 def test_forcing_container_without_docker_is_an_error(companion):
     proc = companion.run("review", "--isolation", "container", scenario="review", check=False)
-    assert proc.returncode == 2
+    assert proc.returncode == 17
     assert "not available" in proc.stderr
     assert companion.jobs() == []
 
@@ -52,8 +52,8 @@ def test_an_image_built_for_another_user_is_refused_with_the_rebuild_command(con
     proc = contained.run(
         "review", "--isolation", "container", scenario="review", check=False, FAKE_DOCKER_IMAGE_USER=other
     )
-    assert proc.returncode == 2
-    assert f"built for user {other}" in proc.stderr and "--build-arg UID=$(id -u)" in proc.stderr
+    assert proc.returncode == 17
+    assert f"built for user {other}" in proc.stderr and "containers/build.sh" in proc.stderr
     report = json.loads(contained.run("setup", "--json", FAKE_DOCKER_IMAGE_USER=other).stdout)
     assert report["image_user_matches"] is False and report["isolation"] == "host"
     assert f"built for user {other}" in report["container_unavailable"]
@@ -90,7 +90,7 @@ def test_review_runs_in_a_container_with_only_the_job_paths_mounted(contained, r
     assert run[run.index("--log-file") + 1] == str(job_mount / "agy.log")
     assert "--init" in options and f"--env=HOME={job_mount / 'home'}" in options
     seeded = job_mount / "home" / ".gemini" / "antigravity-cli"
-    assert (seeded / "antigravity-oauth-token").read_text() == "{}"
+    assert (seeded / "antigravity-oauth-token").read_text() == '{"token": "fake"}'
     assert (seeded / "settings.json").read_text() == '{"enableTerminalSandbox": false}\n'
     assert all(oct((seeded / n).stat().st_mode)[-3:] == "600" for n in ("antigravity-oauth-token", "settings.json"))
     env = dict(o[len("--env=") :].split("=", 1) for o in options if o.startswith("--env="))
@@ -187,14 +187,14 @@ def test_a_resumed_round_keeps_the_conversation_and_refreshes_the_sign_in(contai
     assert (cli / "conversations" / f"{job['conversation_id']}.db").is_file()
     (cli / "settings.json").write_text('{"hooks": "changed by a round"}')
     signin = Path(contained.env["AGY_CONTAINER_HOME"]) / ".gemini" / "antigravity-cli"
-    (signin / "antigravity-oauth-token").write_text('{"fresh": true}')  # a new sign-in since round 1
+    (signin / "antigravity-oauth-token").write_text('{"token": "fresh"}')  # a new sign-in since round 1
     (signin / "settings.json").write_text('{"enableTerminalSandbox": false, "gcp": {"project": "p"}}\n')
     proc = contained.run("task", "--resume-last", "carry on", scenario="container")
     job = contained.job()
     assert job["status"] == "completed", proc.stdout
     assert "Continued" in proc.stdout  # the fake refuses to resume without its conversation file
     assert (cli / "settings.json").read_text() == '{"enableTerminalSandbox": false, "gcp": {"project": "p"}}\n'
-    assert (cli / "antigravity-oauth-token").read_text() == '{"fresh": true}'
+    assert (cli / "antigravity-oauth-token").read_text() == '{"token": "fresh"}'
 
 
 def test_seeding_never_writes_through_a_link_a_round_planted(contained, repo, tmp_path):
@@ -307,3 +307,65 @@ def test_apply_refuses_a_job_without_a_baseline_snapshot(contained, repo):
     proc = contained.run("apply", check=False)
     assert proc.returncode == 2 and "no baseline snapshot" in proc.stderr
     assert "sum(v[1:])" in (repo / "stats.py").read_text()
+
+
+def _signins(tmp_path, monkeypatch) -> tuple[Path, Path]:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("AGY_CONTAINER_HOME", str(tmp_path / "container-home"))
+    host = tmp_path / "home" / ".gemini" / "antigravity-cli"
+    signin = tmp_path / "container-home" / ".gemini" / "antigravity-cli"
+    host.mkdir(parents=True)
+    signin.mkdir(parents=True)
+    return host, signin
+
+
+def _token(directory: Path, name: str, mtime: float) -> None:
+    path = directory / "antigravity-oauth-token"
+    path.write_text(json.dumps({"token": name}))
+    os.utime(path, (mtime, mtime))
+
+
+def test_jobs_copy_the_host_sign_in_with_only_its_cloud_project(tmp_path, monkeypatch):
+    host, signin = _signins(tmp_path, monkeypatch)
+    _token(host, "host", 2000)
+    _token(signin, "container", 1000)
+    (host / "settings.json").write_text(
+        json.dumps({"gcp": {"project": "p", "location": "eu"}, "permissions": {"allow": ["command(*)"]}, "hooks": {}})
+    )
+    (tmp_path / "job").mkdir()
+    cli = container.seed_home(tmp_path / "job") / ".gemini" / "antigravity-cli"
+    assert container.signin_source() == ("host", host)
+    assert json.loads((cli / "antigravity-oauth-token").read_text()) == {"token": "host"}
+    assert json.loads((cli / "settings.json").read_text()) == {
+        "enableTerminalSandbox": False,
+        "gcp": {"project": "p", "location": "eu"},
+    }
+
+
+def test_a_newer_container_sign_in_wins_and_keeps_its_own_settings(tmp_path, monkeypatch):
+    host, signin = _signins(tmp_path, monkeypatch)
+    _token(host, "host", 1000)
+    _token(signin, "container", 2000)
+    (signin / "settings.json").write_text('{"enableTerminalSandbox": false, "gcp": {"project": "c"}}\n')
+    (tmp_path / "job").mkdir()
+    cli = container.seed_home(tmp_path / "job") / ".gemini" / "antigravity-cli"
+    assert json.loads((cli / "antigravity-oauth-token").read_text()) == {"token": "container"}
+    assert (cli / "settings.json").read_text() == '{"enableTerminalSandbox": false, "gcp": {"project": "c"}}\n'
+
+
+def test_a_half_written_or_empty_token_is_never_copied(tmp_path, monkeypatch):
+    host, signin = _signins(tmp_path, monkeypatch)
+    (host / "antigravity-oauth-token").write_text('{"token": "ho')  # agy is rewriting it
+    os.utime(host / "antigravity-oauth-token", (3000, 3000))
+    assert container.signin_source() is None
+    assert not container.container_token_present()
+    _token(signin, "container", 1000)
+    assert container.signin_source() == ("container", signin)
+    (signin / "antigravity-oauth-token").write_text("{}")
+    assert container.signin_source() is None
+
+
+def test_read_dirs_may_not_expose_the_host_sign_in(tmp_path, monkeypatch):
+    host, _ = _signins(tmp_path, monkeypatch)
+    assert "host's agy sign-in" in (container.overlaps_protected(tmp_path / "home" / ".gemini") or "")
+    assert container.overlaps_protected(tmp_path / "elsewhere") is None

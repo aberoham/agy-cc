@@ -22,7 +22,7 @@ SCRIPTS = Path(__file__).resolve().parent
 PLUGIN_ROOT = SCRIPTS.parent
 sys.path.insert(0, str(SCRIPTS))
 
-from agylib import agybin, container, gitctx, render, sandbox  # noqa: E402
+from agylib import agybin, container, failure, gitctx, render, sandbox  # noqa: E402
 from agylib.runner import JobRunner, terminate_job_processes  # noqa: E402
 from agylib.state import (  # noqa: E402
     ACTIVE_STATUSES,
@@ -30,6 +30,7 @@ from agylib.state import (  # noqa: E402
     STATE_DIR_ENV,
     TERMINAL_STATUSES,
     JobStore,
+    drop_working_copy,
     new_job_id,
     now_iso,
     parse_iso,
@@ -67,6 +68,14 @@ READ_ONLY_NOTE = (
 
 class UsageError(Exception):
     pass
+
+
+class ClassifiedError(UsageError):
+    """A refusal to start a job that has its own failure class and exit code."""
+
+    def __init__(self, failure_class: str, message: str):
+        super().__init__(message)
+        self.failure = failure_class
 
 
 def emit(value: Any, as_json: bool) -> None:
@@ -168,7 +177,7 @@ def start_job(
 ) -> int:
     binary = agybin.find_agy()
     if not binary:
-        raise UsageError("agy is not installed or not on PATH. Run /agy:setup.")
+        raise ClassifiedError("agy-missing", "agy is not installed or not on PATH. Run /agy:setup.")
     root = gitctx.repo_root(os.getcwd())
     store = JobStore(root)
     isolation = choose_isolation(args)
@@ -246,7 +255,7 @@ def choose_isolation(args: argparse.Namespace) -> str:
     else:
         reason = container.unavailable_reason()
         if reason is not None and wanted == "container":
-            raise UsageError(f"container isolation is not available: {reason}.")
+            raise ClassifiedError("container", f"container isolation is not available: {reason}.")
         chosen = "host" if reason else "container"
     args.chosen_isolation = chosen
     return chosen
@@ -292,7 +301,7 @@ def wait_or_report(store: JobStore, job_id: str, args: argparse.Namespace) -> in
         job = store.read(job_id) or {}
         if job.get("status") in TERMINAL_STATUSES:
             print(render.result_text(job, read_json(store.job_dir(job_id) / "result.json")))
-            return 0 if job.get("status") != "failed" else 1
+            return failure.exit_code(job.get("failure")) if job.get("status") == "failed" else 0
         time.sleep(2)
     job = store.read(job_id) or {}
     print(f"agy job {job_id} is still running.\n{render.job_detail(job)}")
@@ -383,6 +392,7 @@ def continue_job(
                 "phase": f"resuming ({round_kind})",
                 "next_round_kind": round_kind,
                 "error": None,
+                "failure": None,
                 "queued_commands": [],
                 "pending_approval_wait_s": round(time.time() - finished.timestamp(), 1) if finished else None,
             }
@@ -608,9 +618,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             continue
         if job.get("status") in ACTIVE_STATUSES:
             continue
-        worktree = Path(job.get("worktree") or "")
-        if worktree.exists():
-            gitctx.remove_worktree(job["repo_root"], worktree)
+        if drop_working_copy(job, store.job_dir(job["id"])):
             removed.append(job["id"])
     print(f"Removed {len(removed)} job working cop{'y' if len(removed) == 1 else 'ies'}.")
     return 0
@@ -782,6 +790,9 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         return int(args.func(args) or 0)
+    except ClassifiedError as exc:
+        print(f"agy: {exc}", file=sys.stderr)
+        return failure.exit_code(exc.failure)
     except (UsageError, gitctx.GitError) as exc:
         print(f"agy: {exc}", file=sys.stderr)
         return 2

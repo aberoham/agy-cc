@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 from typing import Any
 
+from . import failure
 from .state import now_iso, parse_iso
 
 SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
@@ -94,6 +95,8 @@ def job_detail(job: dict[str, Any]) -> str:
         )
     if job.get("error"):
         lines.append(f"Error: {job['error']}")
+    if job.get("failure"):
+        lines.append(f"Failure: {job['failure']} (exit {failure.exit_code(job['failure'])})")
     table = rounds_table(job)
     if table:
         lines += ["", table]
@@ -163,6 +166,8 @@ def _result_text(job: dict[str, Any], stored: dict[str, Any] | None) -> str:
     parts = [head, ""]
     if job.get("error"):
         parts += [f"Error: {job['error']}", ""]
+    if job.get("failure"):
+        parts += [f"Failure: {job['failure']} (exit {failure.exit_code(job['failure'])})", ""]
         if stored.get("stderr_tail"):
             parts += ["agy stderr (last lines):", stored["stderr_tail"].strip(), ""]
     kind = job.get("kind")

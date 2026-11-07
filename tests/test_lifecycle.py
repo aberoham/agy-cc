@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -228,6 +229,59 @@ def test_prune_removes_worktrees(companion, repo, monkeypatch):
     state.JobStore(repo).prune()
     assert not Path(job["worktree"]).exists()
     assert job["worktree"] not in git(repo, "worktree", "list")
+
+
+def _age_job(store, job_id: str, days: int, status: str = "completed") -> None:
+    from agylib import state
+
+    stamp = state.datetime.datetime.now(state.datetime.timezone.utc) - state.datetime.timedelta(days=days)
+    completed = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update(job_id, lambda r: r.update({"status": status, "completed_at": completed}))
+
+
+def test_idle_jobs_lose_working_copy_and_home_but_keep_their_patch(contained, repo, monkeypatch):
+    from agylib import container, state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", contained.env["AGY_COMPANION_STATE_DIR"])
+    contained.run("task", "fix it", scenario="task")
+    job = contained.job()
+    store = state.JobStore(repo)
+    job_dir = store.job_dir(job["id"])
+    home = container.job_home(job_dir)
+    assert Path(job["worktree"]).is_dir() and home.is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS - 1)
+    assert state.expire_idle_jobs() == 0
+    assert Path(job["worktree"]).is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    assert state.expire_idle_jobs() == 1
+    assert not Path(job["worktree"]).exists()
+    assert not home.exists()
+    assert (job_dir / "job.json").is_file() and (job_dir / "changes.patch").is_file()
+    assert state.expire_idle_jobs() == 0
+    results = repo.parent / "results.md"
+    results.write_text("more\n")
+    proc = contained.run("resume", job["id"], str(results), check=False)
+    assert "working copy no longer exists" in proc.stdout + proc.stderr
+
+
+def test_idle_expiry_skips_active_jobs_and_survives_a_deleted_repository(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1, status="running")
+    assert state.expire_idle_jobs() == 0
+    assert Path(job["worktree"]).is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    shutil.rmtree(repo / ".git")
+    assert state.expire_idle_jobs() == 1
+    assert not Path(job["worktree"]).exists()
 
 
 @pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS only")

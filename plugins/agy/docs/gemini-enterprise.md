@@ -120,9 +120,10 @@ Placeholders are in capitals.
   2026). The plugin reads the job's log and reports a failed job as a
   licence problem. To fix it, sign out and in again: in host mode, run
   `agy`, type `/logout`, then sign in again and choose a valid licence
-  (agy's changelog names `/logout`; not yet tested here). In container
-  mode, run `containers/signin.sh`, which removes the old container
-  sign-in before it starts agy. Removing
+  (agy's changelog names `/logout`; not yet tested here). Container jobs
+  copy the newer sign-in, so the same host sign-in fixes them; if you use a
+  container-only sign-in, run `containers/signin.sh` instead, which removes
+  the old one before it starts agy. Removing
   `~/.gemini/antigravity-cli/antigravity-oauth-token` also signs the host
   out when agy stores its token in that file.
 - **Some features are not offered to business accounts.** Auto mode is

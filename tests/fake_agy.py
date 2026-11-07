@@ -214,6 +214,15 @@ def main() -> int:
         )
         return 1
 
+    if scenario == "session-expired":
+        # The workforce pool's session ended: agy logs the refresh failure
+        # (the line as seen in real agy logs) and keeps retrying, emitting nothing.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has expired"\n')
+        time.sleep(3600)
+        return 0
+
     stall_models = os.environ.get("FAKE_AGY_STALL_MODEL", "gemini-4-argon-high").split(",")
     if scenario.startswith("stall") and model in stall_models:
         if scenario == "stall-usage":

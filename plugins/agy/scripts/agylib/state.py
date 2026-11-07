@@ -27,6 +27,9 @@ STATE_DIR_ENV = "AGY_COMPANION_STATE_DIR"
 PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA"
 SESSION_ID_ENV = "AGY_COMPANION_SESSION_ID"
 MAX_JOBS = 50
+# A finished job idle this long keeps its record, log and patch but loses its
+# working copy and its agy home, which hold nearly all of its disk space.
+IDLE_DAYS = 7
 
 # "stopping" is active so nothing can resume a job while cancel is stopping it.
 ACTIVE_STATUSES = ("queued", "running", "resuming", "stopping")
@@ -194,16 +197,13 @@ class JobStore:
         """Keep the newest MAX_JOBS finished jobs; never remove an active one.
 
         A pruned job's working copy goes with it, so no stale worktree stays
-        registered in the user's repository.
+        registered in the user's repository. Then, in every repository,
+        finished jobs idle for longer than IDLE_DAYS lose their working copy.
         """
-        from . import gitctx
-
         records = self.list_jobs()
         finished = [r for r in records if r.get("status") not in ACTIVE_STATUSES]
         for record in finished[MAX_JOBS:]:
-            worktree = record.get("worktree")
-            if worktree and Path(worktree).exists():
-                gitctx.remove_worktree(record.get("repo_root") or self.root, Path(worktree))
+            drop_working_copy(record, self.job_dir(record["id"]))
             # A container round may leave read-only directories (a module
             # cache, say) in the job's home; make them removable first.
             for root_dir, dirs, _files in os.walk(self.job_dir(record["id"])):
@@ -213,3 +213,47 @@ class JobStore:
                     except (OSError, NotImplementedError):
                         pass
             shutil.rmtree(self.job_dir(record["id"]), ignore_errors=True)
+        expire_idle_jobs()
+
+
+def drop_working_copy(record: dict[str, Any], job_dir: Path) -> bool:
+    """Remove a finished job's working copy and its container homes; return whether anything went.
+
+    The job can no longer be resumed afterwards, but its record, agy's log
+    and the exported patch stay, so status, result and apply still work.
+    """
+    from . import container, gitctx
+
+    removed = False
+    worktree = Path(record.get("worktree") or "")
+    if record.get("worktree") and worktree.exists():
+        try:
+            gitctx.remove_worktree(record.get("repo_root") or worktree, worktree)
+        except gitctx.GitError:
+            pass  # The repository has moved or gone, so there is no worktree entry to unregister.
+        if worktree.exists():
+            container.remove_tree(worktree)
+        removed = True
+    for home in (container.job_home(job_dir), container.job_mount(job_dir) / "export-home"):
+        if home.is_dir() and not home.is_symlink():
+            container.remove_tree(home)
+            removed = True
+    return removed
+
+
+def expire_idle_jobs(idle_days: int = IDLE_DAYS) -> int:
+    """Drop the working copy of every finished job, in any repository, idle for longer than idle_days.
+
+    Returns how many jobs lost a working copy. Jobs in repositories that are
+    no longer used are reached too, because this walks the whole state root.
+    """
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=idle_days)
+    expired = 0
+    for job_file in state_root().glob("*/jobs/*/job.json"):
+        record = read_json(job_file)
+        if not isinstance(record, dict) or record.get("status") in ACTIVE_STATUSES:
+            continue
+        idle_since = parse_iso(record.get("completed_at") or record.get("updated_at"))
+        if idle_since and idle_since < cutoff and drop_working_copy(record, job_file.parent):
+            expired += 1
+    return expired

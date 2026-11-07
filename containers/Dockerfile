@@ -4,17 +4,20 @@
 # directory. certs/ holds the TLS interception roots (git-ignored); copy them
 # from ~/.docker/certs.d/ before building.
 #
-# Build with the host user's ids, so files the image creates and files on the
-# bind mounts share an owner without any chown at start:
-#   docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t agy-sandbox:experiment containers
-# /agy:setup checks the image's user against yours before a job starts.
+# Build with containers/build.sh. It passes the host user's ids, so files the
+# image creates and files on the bind mounts share an owner without any chown
+# at start, and deletes the untagged images earlier builds left behind (the
+# label below marks them). /agy:setup checks the image's user against yours
+# before a job starts.
 FROM debian:bookworm-slim
+LABEL agy-cc.image=sandbox
 
 COPY certs/ /usr/local/share/ca-certificates/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl git jq procps python3 \
     && update-ca-certificates \
-    && apt-get clean
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
     NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
     UV_SYSTEM_CERTS=1 \

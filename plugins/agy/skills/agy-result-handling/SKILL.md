@@ -31,8 +31,7 @@ Only a host-mode job queues commands; a container job runs its own. A job in `ne
 ## Failures
 
 - If the job failed, show the error and the last agy stderr lines, then stop. Do not do the task yourself in place of agy.
-- If agy is not signed in or not installed, point to `/agy:setup`.
-- If the error names `GEMINI_ENTERPRISE_LICENSE_NOT_VALID`, the organisation reclaimed agy's seat. Pass on the error's sign-in step as it is; do not change the model and retry, because every model fails the same way until the user signs in again.
+- A failed job shows `Failure: <class> (exit <code>)`. Act on the class, not on the wording: `signin` and `licence` need the user to sign in again with `agy` in a terminal, so pass on the error's step as it is and do not change the model and retry, because every model fails the same way until then. `container` needs Colima or Docker started, or the image rebuilt with containers/build.sh. `agy-missing` points to `/agy:setup`. `quota` means wait. Only `stall`, `timeout` and `agy-failed` are worth one retry.
 - If status shows stalls, say which model stalled and which model finished the job.
 
 ## Gotchas

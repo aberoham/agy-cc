@@ -66,7 +66,7 @@ class Companion:
         if container_mode:
             token = tmp / "container-home" / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
             token.parent.mkdir(parents=True, exist_ok=True)
-            token.write_text("{}")
+            token.write_text('{"token": "fake"}')
 
     def run(self, *args: str, scenario: str = "reply", check: bool = True, **env: str) -> subprocess.CompletedProcess:
         proc = subprocess.run(
@@ -77,7 +77,11 @@ class Companion:
             text=True,
             timeout=120,
         )
-        if check and proc.returncode not in (0, 1):
+        # A failed job exits with its failure class's code; anything else
+        # (a usage error, a traceback's 1 with no job) is a test failure.
+        from agylib import failure
+
+        if check and proc.returncode != 0 and proc.returncode not in failure.EXIT_CODES.values():
             raise AssertionError(f"companion failed ({proc.returncode}): {proc.stdout}\n{proc.stderr}")
         return proc
 

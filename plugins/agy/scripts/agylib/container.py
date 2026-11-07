@@ -10,9 +10,9 @@ such file. The job record, the baseline snapshot and the result stay outside
 the mount: the host trusts them, so nothing inside the container may write
 them.
 
-The job's home is seeded at the start of every round from the sign-in home
-(the token and settings that containers/signin.sh wrote) and is never
-shared: one job cannot leave a setting, a hook or a cached package behind
+The job's home is seeded at the start of every round with a copy of the
+newer agy sign-in, the host's own or the one containers/signin.sh wrote, and
+is never shared: one job cannot leave a setting, a hook or a cached package behind
 for the next, whatever repository it was reviewing.
 
 Inside the container agy runs with --dangerously-skip-permissions: it may
@@ -23,6 +23,7 @@ host never runs git over files agy has written.
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shutil
@@ -71,12 +72,12 @@ def image_name() -> str:
     return os.environ.get(IMAGE_ENV) or DEFAULT_IMAGE
 
 
-SIGNIN_FILES = ("antigravity-oauth-token", "settings.json")
-DEFAULT_SETTINGS = '{"enableTerminalSandbox": false}\n'
+TOKEN_FILE = "antigravity-oauth-token"  # noqa: S105 -- a file name, not a secret
+DEFAULT_SETTINGS = {"enableTerminalSandbox": False}
 
 
 def signin_home() -> Path:
-    """Where containers/signin.sh leaves the container sign-in and settings.
+    """Where containers/signin.sh leaves a container-only sign-in and settings.
 
     One per user, beside the host's own ~/.gemini rather than inside a state
     directory, so every state directory (per plugin install, or per test)
@@ -89,9 +90,62 @@ def signin_home() -> Path:
     return Path.home() / ".gemini" / "agy-container-home"
 
 
+def _readable_token(token: Path) -> float | None:
+    """The token file's modification time, or None when it is missing, empty or not JSON.
+
+    A file agy is rewriting at this moment fails to parse and is skipped for
+    this round rather than copied half-written.
+    """
+    try:
+        mtime = token.stat().st_mtime
+        parsed = json.loads(token.read_bytes())
+    except (OSError, ValueError):
+        return None
+    return mtime if isinstance(parsed, dict) and parsed.get("token") else None
+
+
+def signin_source() -> tuple[str, Path] | None:
+    """Which sign-in a job copies: ("host", dir) or ("container", dir), whichever token is newer.
+
+    The host's own `agy` sign-in, in ~/.gemini/antigravity-cli, works inside
+    a container unchanged (a fresh container listed the Gemini 4 Argon
+    models with a copy, 7 November 2026), so a morning sign-in on the host
+    covers container jobs too. The container sign-in from containers/signin.sh
+    is used when the host keeps its token in the keychain instead of a file,
+    or was signed in more recently.
+    """
+    best: tuple[float, str, Path] | None = None
+    for label, directory in (("host", agybin.agy_home()), ("container", signin_home() / ".gemini" / "antigravity-cli")):
+        mtime = _readable_token(directory / TOKEN_FILE)
+        if mtime is not None and (best is None or mtime > best[0]):
+            best = (mtime, label, directory)
+    return (best[1], best[2]) if best else None
+
+
 def container_token_present() -> bool:
-    token = signin_home() / ".gemini" / "antigravity-cli" / "antigravity-oauth-token"
-    return token.is_file() and token.stat().st_size > 0
+    return signin_source() is not None
+
+
+def _job_settings(label: str, source: Path) -> bytes:
+    """settings.json for a job's home.
+
+    The container sign-in's settings were written for containers by
+    containers/signin.sh and are copied as they are. From the host's settings
+    only the Google Cloud project and location are taken: its permission
+    rules, hooks and servers belong to the host, and agy's own terminal
+    sandbox cannot start under Docker's default seccomp profile.
+    """
+    path = source / "settings.json"
+    if label == "container" and path.is_file():
+        return path.read_bytes()
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        host = json.loads(path.read_bytes())
+    except (OSError, ValueError):
+        host = {}
+    if isinstance(host, dict) and "gcp" in host:
+        settings["gcp"] = host["gcp"]
+    return (json.dumps(settings) + "\n").encode()
 
 
 def job_home(job_dir: Path) -> Path:
@@ -100,7 +154,7 @@ def job_home(job_dir: Path) -> Path:
 
 
 def seed_home(job_dir: Path) -> Path:
-    """Give the job its own home with the sign-in and settings, and return it.
+    """Give the job its own home with a copy of the newer sign-in and settings, and return it.
 
     The home belongs to one job: a new job starts empty, so nothing a job on
     another repository did can reach it. Within a job the home persists
@@ -111,7 +165,7 @@ def seed_home(job_dir: Path) -> Path:
     keeps working: refreshing does not rotate it, so copies refreshed
     independently stay valid until the pool session ends.
     """
-    source = signin_home() / ".gemini" / "antigravity-cli"
+    found = signin_source()
     # Every directory below the job directory is agent-writable, so a round
     # could have replaced one with a link to somewhere on the host. Descend
     # with directory descriptors that refuse links, and write through them.
@@ -119,11 +173,12 @@ def seed_home(job_dir: Path) -> Path:
     try:
         for name in (JOB_MOUNT, "home", ".gemini", "antigravity-cli"):
             fd = _descend(fd, name)
-        for name in SIGNIN_FILES:
-            if (source / name).is_file():
-                _write_private(fd, name, (source / name).read_bytes())
-        if not (source / "settings.json").is_file():
-            _write_private(fd, "settings.json", DEFAULT_SETTINGS.encode())
+        if found is None:
+            _write_private(fd, "settings.json", (json.dumps(DEFAULT_SETTINGS) + "\n").encode())
+        else:
+            label, source = found
+            _write_private(fd, TOKEN_FILE, (source / TOKEN_FILE).read_bytes())
+            _write_private(fd, "settings.json", _job_settings(label, source))
     finally:
         os.close(fd)
     return job_home(job_dir)
@@ -194,7 +249,12 @@ def remove_tree(path: Path) -> None:
 def overlaps_protected(directory: Path) -> str | None:
     """Why a --read-dir may not be mounted: it would expose the sign-in or other jobs' state."""
     wanted = Path(os.path.realpath(directory))
-    for label, protected in (("the container sign-in", signin_home()), ("the plugin's state directory", state_root())):
+    protected_dirs = (
+        ("the container sign-in", signin_home()),
+        ("the host's agy sign-in", agybin.agy_home()),
+        ("the plugin's state directory", state_root()),
+    )
+    for label, protected in protected_dirs:
         real = Path(os.path.realpath(protected))
         if wanted == real or wanted in real.parents or real in wanted.parents:
             return f"{directory} overlaps {label} ({protected})"
@@ -296,6 +356,7 @@ def report() -> dict[str, object]:
         "state_mountable": present and state_mountable(),
         "signin_home": str(signin_home()),
         "container_signed_in": container_token_present(),
+        "signin_source": (signin_source() or ("none",))[0],
     }
 
 
@@ -305,15 +366,20 @@ def unavailable_reason(status: dict[str, object] | None = None) -> str | None:
     if not status["docker"]:
         return "docker is not installed or not on PATH"
     if not status["docker_reachable"]:
-        return "the Docker daemon is not reachable (is Colima or Docker Desktop running?)"
+        if shutil.which("colima"):
+            return "the Docker daemon is not reachable; Colima is probably stopped: run `colima start`"
+        return "the Docker daemon is not reachable (is Docker Desktop running?)"
     if not status["image_present"]:
-        return f"the image {status['image']} is not built; see containers/ in the plugin's source repository"
+        return (
+            f"the image {status['image']} is not built (or was deleted); run containers/build.sh "
+            "from the plugin's source repository. The container sign-in is kept, so no new sign-in is needed"
+        )
     if not status["image_user_matches"]:
         if status["image_user"] is None:
             return f"docker could not inspect the image {status['image']}"
         return (
             f"the image {status['image']} was built for user {status['image_user']}, not "
-            f"{os.getuid()}:{os.getgid()}; rebuild it with --build-arg UID=$(id -u) --build-arg GID=$(id -g)"
+            f"{os.getuid()}:{os.getgid()}; rebuild it with containers/build.sh"
         )
     if not status["state_mountable"]:
         return (
@@ -321,7 +387,10 @@ def unavailable_reason(status: dict[str, object] | None = None) -> str | None:
             "set AGY_COMPANION_STATE_DIR to a directory under your home"
         )
     if not status["container_signed_in"]:
-        return f"agy is not signed in for containers; run containers/signin.sh (it writes to {signin_home()})"
+        return (
+            "agy is not signed in: run `agy` in a terminal and sign in (containers use a copy of that "
+            f"sign-in), or run containers/signin.sh for a container-only sign-in in {signin_home()}"
+        )
     return None
 
 
