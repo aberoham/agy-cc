@@ -138,6 +138,8 @@ def _follow(
     last_event = time.monotonic()
     active_tools: set[int] = set()
     result: dict[str, Any] | None = None
+    log_tail = ""
+    log_outcome: TurnOutcome | None = None
     with open(events_path, "a", encoding="utf-8") as events:
         while True:
             try:
@@ -171,13 +173,20 @@ def _follow(
             if now - last_event > limit:
                 return TurnOutcome("stall", f"no agy event for {int(limit)} s", result)
             chunk, log_offset = _read_log_chunk(log_path, log_offset)
-            if chunk:
-                if failure.SESSION_EXPIRED in chunk and result is None:
-                    # Resuming on another model cannot help; only a new sign-in can.
-                    return TurnOutcome("signin", f"agy log: {failure.SESSION_EXPIRED}", result)
-                match = agybin.STALL_LOG_PATTERN.search(chunk)
-                if match and result is None:
-                    return TurnOutcome("stall", f"agy log: {match.group(0)}", result)
+            if chunk and log_outcome is None:
+                # The previous read's tail is searched again, so a line split
+                # between two reads still matches.
+                window = log_tail + chunk
+                log_tail = window[-LOG_TAIL_CHARS:]
+                log_outcome = _log_outcome(window)
+            if result is not None:
+                log_outcome = None
+            elif log_outcome is not None and not line:
+                # Act on the log only once agy's output has gone quiet, so a
+                # result already written to stdout is never thrown away.
+                return log_outcome
+    if result is None and log_outcome is not None:
+        return log_outcome
     # stdout is closed; agy should exit now, but keep enforcing the deadline.
     while proc.poll() is None:
         if time.monotonic() > deadline:
@@ -190,6 +199,20 @@ def _follow(
     if result is not None:
         return TurnOutcome("result", str(result.get("status", "")), result)
     return TurnOutcome("exited", f"agy exited with code {proc.returncode} and no result", None)
+
+
+LOG_TAIL_CHARS = 512
+
+
+def _log_outcome(text: str) -> TurnOutcome | None:
+    """How agy's log says the turn has ended, if it does."""
+    if failure.SESSION_EXPIRED in text:
+        # Resuming on another model cannot help; only a new sign-in can.
+        return TurnOutcome("signin", f"agy log: {failure.SESSION_EXPIRED}", None)
+    match = agybin.STALL_LOG_PATTERN.search(text)
+    if match:
+        return TurnOutcome("stall", f"agy log: {match.group(0)}", None)
+    return None
 
 
 def _open_regular(path: str | Path) -> int | None:

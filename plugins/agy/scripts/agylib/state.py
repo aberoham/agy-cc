@@ -203,17 +203,31 @@ class JobStore:
         records = self.list_jobs()
         finished = [r for r in records if r.get("status") not in ACTIVE_STATUSES]
         for record in finished[MAX_JOBS:]:
-            drop_working_copy(record, self.job_dir(record["id"]))
+            self._remove_job(record["id"])
+        expire_idle_jobs()
+
+    def _remove_job(self, job_id: str) -> None:
+        """Remove a finished job and its working copy, rechecking its status under the job's lock.
+
+        A resume takes the same lock to mark the job queued, so a job resumed
+        since list_jobs read it is left alone.
+        """
+        job_dir = self.job_dir(job_id)
+        path = job_dir / "job.json"
+        with locked(path):
+            record = read_json(path)
+            if not isinstance(record, dict) or record.get("status") in ACTIVE_STATUSES:
+                return
+            drop_working_copy(record, job_dir)
             # A container round may leave read-only directories (a module
             # cache, say) in the job's home; make them removable first.
-            for root_dir, dirs, _files in os.walk(self.job_dir(record["id"])):
+            for root_dir, dirs, _files in os.walk(job_dir):
                 for name in dirs:
                     try:
                         os.chmod(os.path.join(root_dir, name), 0o700, follow_symlinks=False)
                     except (OSError, NotImplementedError):
                         pass
-            shutil.rmtree(self.job_dir(record["id"]), ignore_errors=True)
-        expire_idle_jobs()
+            shutil.rmtree(job_dir, ignore_errors=True)
 
 
 def drop_working_copy(record: dict[str, Any], job_dir: Path) -> bool:
@@ -235,10 +249,40 @@ def drop_working_copy(record: dict[str, Any], job_dir: Path) -> bool:
             container.remove_tree(worktree)
         removed = True
     for home in (container.job_home(job_dir), container.job_mount(job_dir) / "export-home"):
-        if home.is_dir() and not home.is_symlink():
+        if _owned_dir(job_dir, home):
             container.remove_tree(home)
             removed = True
     return removed
+
+
+def drop_finished_working_copy(
+    job_dir: Path, should_drop: Callable[[dict[str, Any]], bool] = lambda _record: True
+) -> bool:
+    """drop_working_copy for a job that is finished and passes should_drop, checked under its lock.
+
+    A resume takes the same lock to mark the job queued and checks there
+    that the working copy still exists, so the two cannot interleave.
+    """
+    path = job_dir / "job.json"
+    with locked(path):
+        record = read_json(path)
+        if not isinstance(record, dict) or record.get("status") in ACTIVE_STATUSES or not should_drop(record):
+            return False
+        return drop_working_copy(record, job_dir)
+
+
+def _owned_dir(job_dir: Path, path: Path) -> bool:
+    """Whether path is a real directory reached from job_dir through no symbolic link.
+
+    Directories below the job directory are writable from inside the
+    container, so a round could replace any of them with a link to the host.
+    """
+    current = job_dir
+    for part in path.relative_to(job_dir).parts:
+        current = current / part
+        if current.is_symlink() or not current.is_dir():
+            return False
+    return True
 
 
 def expire_idle_jobs(idle_days: int = IDLE_DAYS) -> int:
@@ -250,10 +294,11 @@ def expire_idle_jobs(idle_days: int = IDLE_DAYS) -> int:
     cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=idle_days)
     expired = 0
     for job_file in state_root().glob("*/jobs/*/job.json"):
-        record = read_json(job_file)
-        if not isinstance(record, dict) or record.get("status") in ACTIVE_STATUSES:
-            continue
-        idle_since = parse_iso(record.get("completed_at") or record.get("updated_at"))
-        if idle_since and idle_since < cutoff and drop_working_copy(record, job_file.parent):
+
+        def idle(record: dict[str, Any]) -> bool:
+            idle_since = parse_iso(record.get("completed_at") or record.get("updated_at"))
+            return bool(idle_since and idle_since < cutoff)
+
+        if drop_finished_working_copy(job_file.parent, idle):
             expired += 1
     return expired

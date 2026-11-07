@@ -30,7 +30,7 @@ from agylib.state import (  # noqa: E402
     STATE_DIR_ENV,
     TERMINAL_STATUSES,
     JobStore,
-    drop_working_copy,
+    drop_finished_working_copy,
     new_job_id,
     now_iso,
     parse_iso,
@@ -379,12 +379,13 @@ def continue_job(
     job's own "writable" flag is left alone, so the export after the round and
     /agy:apply still see the edits earlier rounds made."""
     job_id = job["id"]
-    if not Path(job.get("worktree") or "").is_dir():
-        raise UsageError(f"Job {job_id}'s working copy no longer exists; start a new job.")
 
     def mutate(record: dict[str, Any]) -> None:
         if record.get("status") in ACTIVE_STATUSES:
             raise UsageError(f"Job {job_id} is still running.")
+        # Checked under the lock that cleanup and expiry also take.
+        if not Path(record.get("worktree") or "").is_dir():
+            raise UsageError(f"Job {job_id}'s working copy no longer exists; start a new job.")
         finished = parse_iso(record.get("completed_at"))
         record.update(
             {
@@ -411,7 +412,17 @@ def continue_job(
             gitctx.install_hooks(Path(record["worktree"]), hook_command(job_dir))  # .agents holds only the hook again
         except Exception as exc:
             error = f"could not prepare the working copy: {exc}"
-            store.update(job_id, lambda r: r.update({"status": "failed", "phase": "failed", "error": error}))
+            store.update(
+                job_id,
+                lambda r: r.update(
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error": error,
+                        "failure": failure.classify("exited", error),
+                    }
+                ),
+            )
             raise
         write_json(job_dir / "policy.json", policy_for(record))
     (job_dir / "next-message.md").write_text(message, encoding="utf-8")
@@ -468,7 +479,14 @@ def cmd_worker(args: argparse.Namespace) -> int:
         def fail(record: dict[str, Any]) -> None:
             if record.get("status") != "cancelled":
                 record.update(
-                    {"status": "failed", "phase": "failed", "error": error, "pid": None, "completed_at": now_iso()}
+                    {
+                        "status": "failed",
+                        "phase": "failed",
+                        "error": error,
+                        "failure": failure.classify("exited", error),
+                        "pid": None,
+                        "completed_at": now_iso(),
+                    }
                 )
 
         store.update(args.job, fail)
@@ -616,9 +634,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     for job in store.list_jobs():
         if args.job and not job["id"].startswith(args.job):
             continue
-        if job.get("status") in ACTIVE_STATUSES:
-            continue
-        if drop_working_copy(job, store.job_dir(job["id"])):
+        if drop_finished_working_copy(store.job_dir(job["id"])):
             removed.append(job["id"])
     print(f"Removed {len(removed)} job working cop{'y' if len(removed) == 1 else 'ies'}.")
     return 0

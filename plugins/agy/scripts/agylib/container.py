@@ -90,18 +90,30 @@ def signin_home() -> Path:
     return Path.home() / ".gemini" / "agy-container-home"
 
 
-def _readable_token(token: Path) -> float | None:
-    """The token file's modification time, or None when it is missing, empty or not JSON.
+def _readable_token(token: Path) -> tuple[float, bytes] | None:
+    """The token file's modification time and contents, or None when it is missing, empty or not JSON.
 
-    A file agy is rewriting at this moment fails to parse and is skipped for
-    this round rather than copied half-written.
+    The contents returned are the bytes that were parsed, so a job copies
+    exactly what was checked. A file agy is rewriting at this moment fails
+    to parse and is skipped for this round rather than copied half-written.
     """
     try:
         mtime = token.stat().st_mtime
-        parsed = json.loads(token.read_bytes())
+        data = token.read_bytes()
+        parsed = json.loads(data)
     except (OSError, ValueError):
         return None
-    return mtime if isinstance(parsed, dict) and parsed.get("token") else None
+    return (mtime, data) if isinstance(parsed, dict) and parsed.get("token") else None
+
+
+def _newest_signin() -> tuple[str, Path, bytes] | None:
+    """The label, directory and checked token bytes of the newer readable sign-in."""
+    best: tuple[float, str, Path, bytes] | None = None
+    for label, directory in (("host", agybin.agy_home()), ("container", signin_home() / ".gemini" / "antigravity-cli")):
+        readable = _readable_token(directory / TOKEN_FILE)
+        if readable is not None and (best is None or readable[0] > best[0]):
+            best = (readable[0], label, directory, readable[1])
+    return best[1:] if best else None
 
 
 def signin_source() -> tuple[str, Path] | None:
@@ -114,12 +126,8 @@ def signin_source() -> tuple[str, Path] | None:
     is used when the host keeps its token in the keychain instead of a file,
     or was signed in more recently.
     """
-    best: tuple[float, str, Path] | None = None
-    for label, directory in (("host", agybin.agy_home()), ("container", signin_home() / ".gemini" / "antigravity-cli")):
-        mtime = _readable_token(directory / TOKEN_FILE)
-        if mtime is not None and (best is None or mtime > best[0]):
-            best = (mtime, label, directory)
-    return (best[1], best[2]) if best else None
+    found = _newest_signin()
+    return (found[0], found[1]) if found else None
 
 
 def container_token_present() -> bool:
@@ -165,7 +173,7 @@ def seed_home(job_dir: Path) -> Path:
     keeps working: refreshing does not rotate it, so copies refreshed
     independently stay valid until the pool session ends.
     """
-    found = signin_source()
+    found = _newest_signin()
     # Every directory below the job directory is agent-writable, so a round
     # could have replaced one with a link to somewhere on the host. Descend
     # with directory descriptors that refuse links, and write through them.
@@ -176,8 +184,8 @@ def seed_home(job_dir: Path) -> Path:
         if found is None:
             _write_private(fd, "settings.json", (json.dumps(DEFAULT_SETTINGS) + "\n").encode())
         else:
-            label, source = found
-            _write_private(fd, TOKEN_FILE, (source / TOKEN_FILE).read_bytes())
+            label, source, token = found
+            _write_private(fd, TOKEN_FILE, token)
             _write_private(fd, "settings.json", _job_settings(label, source))
     finally:
         os.close(fd)

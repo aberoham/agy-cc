@@ -369,3 +369,20 @@ def test_read_dirs_may_not_expose_the_host_sign_in(tmp_path, monkeypatch):
     host, _ = _signins(tmp_path, monkeypatch)
     assert "host's agy sign-in" in (container.overlaps_protected(tmp_path / "home" / ".gemini") or "")
     assert container.overlaps_protected(tmp_path / "elsewhere") is None
+
+
+def test_a_job_gets_the_token_bytes_that_were_checked_even_if_the_file_changes(tmp_path, monkeypatch):
+    host, _ = _signins(tmp_path, monkeypatch)
+    _token(host, "checked", 2000)
+    real_read_bytes = Path.read_bytes
+
+    def read_then_rewrite(path: Path) -> bytes:
+        data = real_read_bytes(path)
+        if path.name == "antigravity-oauth-token":
+            path.write_text('{"token":')  # agy starts rewriting it straight after the check
+        return data
+
+    monkeypatch.setattr(Path, "read_bytes", read_then_rewrite)
+    (tmp_path / "job").mkdir()
+    cli = container.seed_home(tmp_path / "job") / ".gemini" / "antigravity-cli"
+    assert json.loads(real_read_bytes(cli / "antigravity-oauth-token")) == {"token": "checked"}

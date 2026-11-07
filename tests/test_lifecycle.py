@@ -432,3 +432,36 @@ def test_stalled_attempt_keeps_its_step_usage(companion):
     )
     usage = companion.job()["rounds"][0]["usage"]
     assert usage["total_tokens"] == 50 + 120
+
+
+def test_cleanup_never_follows_a_link_a_round_put_in_the_job_directory(companion, repo, tmp_path, monkeypatch):
+    from agylib import container, state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    job_dir = state.JobStore(repo).job_dir(job["id"])
+    outside = tmp_path / "outside"
+    (outside / "home").mkdir(parents=True)
+    (outside / "home" / "keep.txt").write_text("host data\n")
+    mount = container.job_mount(job_dir)
+    if mount.exists():
+        shutil.rmtree(mount)
+    mount.symlink_to(outside, target_is_directory=True)
+    state.drop_working_copy(job, job_dir)
+    assert (outside / "home" / "keep.txt").is_file()
+
+
+def test_pruning_and_expiry_recheck_the_status_under_the_job_lock(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    # A resume marked the job queued after a list read it as completed.
+    store.update(job["id"], lambda r: r.update({"status": "queued"}))
+    assert not state.drop_finished_working_copy(store.job_dir(job["id"]))
+    store._remove_job(job["id"])
+    assert Path(job["worktree"]).is_dir() and (store.job_dir(job["id"]) / "job.json").is_file()

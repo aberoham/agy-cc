@@ -98,3 +98,16 @@ def test_a_resumed_job_drops_its_old_failure(companion, repo):
     companion.run("resume", job["id"], str(results), NO_SANDBOX, scenario="task")
     job = companion.job()
     assert job["status"] == "completed" and job.get("failure") is None
+
+
+def test_an_expired_session_split_across_log_reads_is_still_caught(companion):
+    proc = companion.run("review", NO_SANDBOX, scenario="session-expired-split", check=False)
+    assert proc.returncode == 11
+    assert companion.job()["failure"] == "signin"
+
+
+def test_a_result_already_on_stdout_wins_over_a_later_expired_session(companion):
+    proc = companion.run("review", NO_SANDBOX, scenario="result-then-session-expired", check=False)
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    job = companion.job()
+    assert job["status"] == "completed" and job.get("failure") is None
