@@ -1,11 +1,17 @@
-# agy-cc
+# Contained Antigravity for Claude Code
+
+Run Google's Antigravity CLI from Claude Code inside a container, never with
+`--yolo` on your workstation.
+
+Without Docker or Colima, jobs fall back to host mode: a git worktree, a hook
+policy on every tool call and macOS `sandbox-exec`, still without `--yolo`.
 
 A Claude Code plugin that hands code review, adversarial review, plan writing
 and rescue tasks to Google's Antigravity CLI (`agy`, Gemini 4 Argon) as
 tracked, isolated background jobs.
 
 - The plugin is in [`plugins/agy`](plugins/agy); its [README](plugins/agy/README.md) covers prerequisites, install, commands and gotchas.
-- Install it with `/plugin marketplace add aberoham/agy-cc`, then `/plugin install agy@agy-cc`.
+- Install it with `/plugin marketplace add aberoham/contained-antigravity-for-claude-code`, then `/plugin install agy@agy-cc`.
 - [`NOTES.md`](NOTES.md) records how agy 1.4.7 was observed to behave, and the open questions.
 - [`containers/`](containers) holds the image and the sign-in script for container isolation. Its design follows Matt Pocock's [Sandcastle](https://github.com/mattpocock/sandcastle).
 
