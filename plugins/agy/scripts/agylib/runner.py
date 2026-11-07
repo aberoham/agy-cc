@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
-from . import agybin, container, gitctx, sandbox
+from . import agybin, container, failure, gitctx, sandbox
 from .policy import WRITE_TOOLS
 from .state import JobStore, now_iso, read_json, write_json
 
@@ -33,11 +33,6 @@ DEFAULT_MAX_STALL_RESUMES = 2
 DEFAULT_MAX_MINUTES = 60
 PROGRESS_WRITE_INTERVAL = 1.0
 PERMISSION_DENIED = re.compile(r'permission check failed for command "(.*)": ', re.S)
-AUTH_HINTS = ("authentication required", "authentication timed out", "not signed in")
-# When Google reclaims the Gemini Enterprise seat behind a saved sign-in,
-# agy cannot list its models and rejects every model name as unknown. The
-# reason appears only in agy's log, as this error code on a 403 response.
-LICENCE_NOT_VALID = "GEMINI_ENTERPRISE_LICENSE_NOT_VALID"
 
 CONTINUE_AFTER_STALL = (
     "Your previous attempt stopped because the model stream stalled. Continue the same "
@@ -46,7 +41,7 @@ CONTINUE_AFTER_STALL = (
 
 
 class TurnOutcome(NamedTuple):
-    kind: str  # "result", "stall", "exited", "timeout"
+    kind: str  # "result", "stall", "exited", "timeout", "signin"
     detail: str
     result: dict[str, Any] | None
 
@@ -143,6 +138,9 @@ def _follow(
     last_event = time.monotonic()
     active_tools: set[int] = set()
     result: dict[str, Any] | None = None
+    log_tail = ""
+    log_outcome: TurnOutcome | None = None
+    log_seen = 0.0
     with open(events_path, "a", encoding="utf-8") as events:
         while True:
             try:
@@ -176,10 +174,22 @@ def _follow(
             if now - last_event > limit:
                 return TurnOutcome("stall", f"no agy event for {int(limit)} s", result)
             chunk, log_offset = _read_log_chunk(log_path, log_offset)
-            if chunk:
-                match = agybin.STALL_LOG_PATTERN.search(chunk)
-                if match and result is None:
-                    return TurnOutcome("stall", f"agy log: {match.group(0)}", result)
+            if chunk and log_outcome is None:
+                # The previous read's tail is searched again, so a line split
+                # between two reads still matches.
+                window = log_tail + chunk
+                log_tail = window[-LOG_TAIL_CHARS:]
+                log_outcome = _log_outcome(window)
+                log_seen = now
+            if result is not None:
+                log_outcome = None
+            elif log_outcome is not None and (not line or now - log_seen > LOG_DRAIN_SECONDS):
+                # Act on the log once agy's output has gone quiet, so a result
+                # already written to stdout is never thrown away, or after a
+                # short wait if agy keeps emitting events without a result.
+                return log_outcome
+    if result is None and log_outcome is not None:
+        return log_outcome
     # stdout is closed; agy should exit now, but keep enforcing the deadline.
     while proc.poll() is None:
         if time.monotonic() > deadline:
@@ -192,6 +202,22 @@ def _follow(
     if result is not None:
         return TurnOutcome("result", str(result.get("status", "")), result)
     return TurnOutcome("exited", f"agy exited with code {proc.returncode} and no result", None)
+
+
+LOG_TAIL_CHARS = 512
+# How long a log outcome waits for a result while agy keeps emitting events.
+LOG_DRAIN_SECONDS = 10.0
+
+
+def _log_outcome(text: str) -> TurnOutcome | None:
+    """How agy's log says the turn has ended, if it does."""
+    if failure.SESSION_EXPIRED in text:
+        # Resuming on another model cannot help; only a new sign-in can.
+        return TurnOutcome("signin", f"agy log: {failure.SESSION_EXPIRED}", None)
+    match = agybin.STALL_LOG_PATTERN.search(text)
+    if match:
+        return TurnOutcome("stall", f"agy log: {match.group(0)}", None)
+    return None
 
 
 def _open_regular(path: str | Path) -> int | None:
@@ -464,6 +490,7 @@ class JobRunner:
             "queued_commands": commands,
         }
         error = None
+        failure_class = None
         stderr_tail = _tail(self.stderr_path, self.stderr_start)
         if outcome.kind != "result":
             error = outcome.detail
@@ -471,7 +498,9 @@ class JobRunner:
         elif result.get("status") != "SUCCESS":
             error = result.get("error") or f"agy finished with status {result.get('status')}"
         if error is not None:
-            error = self._signin_problem(stderr_tail) or error
+            log_text, _ = _read_log_chunk(self.log_path, self.log_start)
+            failure_class = failure.classify(outcome.kind, stderr_tail, log_text, str(result.get("error") or ""))
+            error = failure.ADVICE.get(failure_class, error)
 
         kind = self.job["kind"]
         # agy can report an error (a stream idle timeout, seen live) and still
@@ -495,7 +524,8 @@ class JobRunner:
                 stored["changed_files"] = changes["name_status"]
                 stored["changed_paths"] = changes["paths"]
             except (gitctx.GitError, RuntimeError) as exc:
-                error = error or f"could not export agy's changes: {exc}"
+                if error is None:
+                    error, failure_class = f"could not export agy's changes: {exc}", "agy-failed"
 
         write_json(self.dir / "result.json", stored)
         if error is not None:
@@ -517,6 +547,7 @@ class JobRunner:
                     "status": status,
                     "phase": "done" if status == "completed" else status,
                     "error": error,
+                    "failure": failure_class,
                     "pid": None,
                     "agy_pid": None,
                     "container": None,
@@ -536,26 +567,6 @@ class JobRunner:
         if self.job.get("kind") != "task" and record.get("status") in ("completed", "failed", "cancelled"):
             gitctx.remove_worktree(self.job["repo_root"], Path(self.job["worktree"]))
         return record
-
-    def _signin_problem(self, stderr_tail: str) -> str | None:
-        """What to tell the user when this round failed for lack of a sign-in or a valid seat."""
-        in_container = self.job.get("isolation") == "container"
-        log_text, _ = _read_log_chunk(self.log_path, self.log_start)
-        if LICENCE_NOT_VALID in log_text:
-            if in_container:
-                where = "Run containers/signin.sh in a terminal"
-            else:
-                where = "Run `agy` in a terminal, type /logout"
-            return (
-                f"Google rejected agy's Gemini Enterprise licence ({LICENCE_NOT_VALID}), so agy "
-                f"could not list its models. {where}, sign in again and choose a valid licence, "
-                "then resume this job."
-            )
-        if any(hint in stderr_tail.lower() for hint in AUTH_HINTS):
-            if in_container:
-                return "agy is not signed in for containers. Run containers/signin.sh in a terminal."
-            return "agy is not signed in. Run /agy:setup, then sign in with `agy` in a terminal."
-        return None
 
     def _read_plan(self, path: Path) -> str | None:
         """The plan artifact's text, or None unless the file really sits under the brain directory.

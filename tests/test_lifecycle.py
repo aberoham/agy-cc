@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -230,6 +232,59 @@ def test_prune_removes_worktrees(companion, repo, monkeypatch):
     assert job["worktree"] not in git(repo, "worktree", "list")
 
 
+def _age_job(store, job_id: str, days: int, status: str = "completed") -> None:
+    from agylib import state
+
+    stamp = state.datetime.datetime.now(state.datetime.timezone.utc) - state.datetime.timedelta(days=days)
+    completed = stamp.strftime("%Y-%m-%dT%H:%M:%SZ")
+    store.update(job_id, lambda r: r.update({"status": status, "completed_at": completed}))
+
+
+def test_idle_jobs_lose_working_copy_and_home_but_keep_their_patch(contained, repo, monkeypatch):
+    from agylib import container, state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", contained.env["AGY_COMPANION_STATE_DIR"])
+    contained.run("task", "fix it", scenario="task")
+    job = contained.job()
+    store = state.JobStore(repo)
+    job_dir = store.job_dir(job["id"])
+    home = container.job_home(job_dir)
+    assert Path(job["worktree"]).is_dir() and home.is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS - 1)
+    assert state.expire_idle_jobs() == 0
+    assert Path(job["worktree"]).is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    assert state.expire_idle_jobs() == 1
+    assert not Path(job["worktree"]).exists()
+    assert not home.exists()
+    assert (job_dir / "job.json").is_file() and (job_dir / "changes.patch").is_file()
+    assert state.expire_idle_jobs() == 0
+    results = repo.parent / "results.md"
+    results.write_text("more\n")
+    proc = contained.run("resume", job["id"], str(results), check=False)
+    assert "working copy no longer exists" in proc.stdout + proc.stderr
+
+
+def test_idle_expiry_skips_active_jobs_and_survives_a_deleted_repository(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1, status="running")
+    assert state.expire_idle_jobs() == 0
+    assert Path(job["worktree"]).is_dir()
+
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    shutil.rmtree(repo / ".git")
+    assert state.expire_idle_jobs() == 1
+    assert not Path(job["worktree"]).exists()
+
+
 @pytest.mark.skipif(sys.platform != "darwin", reason="sandbox-exec is macOS only")
 def test_sandbox_blocks_writes_to_the_checkout_that_bypass_the_hook(companion, repo):
     target = repo / "escaped.txt"
@@ -378,3 +433,104 @@ def test_stalled_attempt_keeps_its_step_usage(companion):
     )
     usage = companion.job()["rounds"][0]["usage"]
     assert usage["total_tokens"] == 50 + 120
+
+
+def test_cleanup_never_follows_a_link_a_round_put_in_the_job_directory(companion, repo, tmp_path, monkeypatch):
+    from agylib import container, state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    job_dir = state.JobStore(repo).job_dir(job["id"])
+    outside = tmp_path / "outside"
+    (outside / "home").mkdir(parents=True)
+    (outside / "home" / "keep.txt").write_text("host data\n")
+    mount = container.job_mount(job_dir)
+    if mount.exists():
+        shutil.rmtree(mount)
+    mount.symlink_to(outside, target_is_directory=True)
+    state.drop_working_copy(job, job_dir)
+    assert (outside / "home" / "keep.txt").is_file()
+
+
+def test_pruning_and_expiry_recheck_the_status_under_the_job_lock(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    _age_job(store, job["id"], days=state.IDLE_DAYS + 1)
+    # A resume marked the job queued after a list read it as completed.
+    store.update(job["id"], lambda r: r.update({"status": "queued"}))
+    assert not state.drop_finished_working_copy(store.job_dir(job["id"]))
+    store._remove_job(job["id"])
+    assert Path(job["worktree"]).is_dir() and (store.job_dir(job["id"]) / "job.json").is_file()
+
+
+def test_resume_refuses_a_record_with_no_working_copy_recorded(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    store.update(job["id"], lambda r: r.pop("worktree"))
+    results = repo.parent / "results.md"
+    results.write_text("more\n")
+    proc = companion.run("resume", job["id"], str(results), NO_SANDBOX, check=False)
+    assert "working copy no longer exists" in proc.stdout + proc.stderr
+    assert companion.job()["status"] == job["status"]
+
+
+def _in_thread(target) -> tuple[threading.Thread, list]:
+    outcome: list = []
+
+    def run() -> None:
+        try:
+            outcome.append(target())
+        except Exception as exc:  # noqa: BLE001 - the test inspects what the thread raised
+            outcome.append(exc)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, outcome
+
+
+def test_expiry_waits_for_a_resume_holding_the_lock_and_then_spares_the_job(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    job_dir = state.JobStore(repo).job_dir(job["id"])
+    path = job_dir / "job.json"
+    with state.locked(path):  # a resume is part-way through marking the job queued
+        thread, outcome = _in_thread(lambda: state.drop_finished_working_copy(job_dir))
+        time.sleep(0.5)
+        assert thread.is_alive()  # waiting for the lock, not acting on a status read earlier
+        state.write_json(path, dict(json.loads(path.read_text()), status="queued"))
+    thread.join(10)
+    assert outcome == [False]
+    assert Path(job["worktree"]).is_dir()
+
+
+def test_a_resume_waiting_on_cleanup_sees_the_working_copy_is_gone(companion, companion_module, repo):
+    import argparse
+
+    from agylib import state
+
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    job_dir = store.job_dir(job["id"])
+    args = argparse.Namespace(model=None, background=True, wait=False)
+    with state.locked(job_dir / "job.json"):  # cleanup holds the lock
+        thread, outcome = _in_thread(lambda: companion_module.continue_job(store, job, "more", "approval-resume", args))
+        time.sleep(0.5)
+        assert thread.is_alive()
+        state.drop_working_copy(job, job_dir)
+    thread.join(10)
+    assert len(outcome) == 1 and isinstance(outcome[0], companion_module.UsageError)
+    assert "working copy no longer exists" in str(outcome[0])
+    assert companion.job()["status"] == job["status"]  # unchanged: the resume never queued it

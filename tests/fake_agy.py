@@ -214,6 +214,51 @@ def main() -> int:
         )
         return 1
 
+    if scenario == "session-expired":
+        # The workforce pool's session ended: agy logs the refresh failure
+        # (the line as seen in real agy logs) and keeps retrying, emitting nothing.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has expired"\n')
+        time.sleep(3600)
+        return 0
+
+    if scenario == "session-expired-split":
+        # The expired-session line reaches the log in two writes, so the
+        # follower may read it across two log reads.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has ')
+            time.sleep(3)
+            with open(log_file, "a") as log:
+                log.write('expired"\n')
+        time.sleep(3600)
+        return 0
+
+    if scenario == "session-expired-chatty":
+        # agy keeps emitting events but never a result after the session ends.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has expired"\n')
+        for index in range(1, 100000):
+            emit({"event": "step_update", "step_update": {"conversation_id": conversation, "step_index": index}})
+            time.sleep(0.2)
+        return 0
+
+    if scenario == "result-then-session-expired":
+        # The answer is already on stdout when the log reports the expiry.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has expired"\n')
+        time.sleep(0.2)
+        emit(
+            {"event": "step_update", "step_update": {"conversation_id": conversation, "step_index": 1, "state": "DONE"}}
+        )
+        review = {"verdict": "approve", "summary": "Fine.", "findings": [], "next_steps": []}
+        result(conversation, json.dumps(review), structured_output=review)
+        time.sleep(5)
+        return 0
+
     stall_models = os.environ.get("FAKE_AGY_STALL_MODEL", "gemini-4-argon-high").split(",")
     if scenario.startswith("stall") and model in stall_models:
         if scenario == "stall-usage":

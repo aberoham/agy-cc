@@ -16,10 +16,14 @@ works on its own copy of your repository, so agy never edits your checkout.
   window. `/agy:setup` shows the project agy will use.
 - **git**, and `python3` 3.9 or later. The macOS system Python from the
   Command Line Tools is enough; the plugin needs no packages.
-- **Docker or Colima, and the agy image**, for container isolation. Build the
-  image from `containers/` in the source repository with your own user ids
-  (`--build-arg UID=$(id -u) --build-arg GID=$(id -g)`) and sign in once with
-  `containers/signin.sh`. Without them the plugin falls back to host mode,
+- **Docker or Colima, and the agy image**, for container isolation. Run
+  `containers/build.sh` from the source repository. It starts Colima if it
+  is stopped and builds the image for your user; run it again if the image
+  is ever deleted. Container jobs use a copy of your ordinary `agy` sign-in,
+  so there is no second sign-in. `containers/signin.sh` makes a separate
+  container-only sign-in, for a host whose agy keeps its token in the
+  keychain rather than in `~/.gemini/antigravity-cli/antigravity-oauth-token`.
+  Without Docker and the image the plugin falls back to host mode,
   described below. The image carries `git`, `curl`, `jq`, `python3` and `uv`,
   so agy can run a Python repository's tests; add what your repositories
   need to the Dockerfile. Each job starts with an empty uv cache, so a job
@@ -63,8 +67,8 @@ Then run `/agy:setup`.
 
 Most commands accept `--model high|medium|low` (Gemini 4 Argon High, Medium or
 Low), `--background` and `--isolation container|host`. The default model is
-Medium. The default isolation is the container when Docker, the image and the
-container sign-in are all present, otherwise the host; `/agy:setup` says
+Medium. The default isolation is the container when Docker, the image and a
+sign-in file are all present, otherwise the host; `/agy:setup` says
 which, and `/agy:status` shows it per job.
 
 ## How a job is contained
@@ -86,14 +90,15 @@ home) and the plugin's own files (read-only). Nothing else from your machine
 is mounted, so there is no `~/.aws`, `~/.ssh` or keychain to read, and the
 job record, the baseline snapshot and the result, which the host trusts, are
 out of the container's reach. The job's home belongs to that job alone: it
-starts empty, receives a copy of the container sign-in and settings from
-`~/.gemini/agy-container-home` (which is never mounted into a job) at the
-start of every round, and keeps agy's conversation between rounds so a
+starts empty, receives a copy of the newer agy sign-in at the start of every
+round (your own from `~/.gemini/antigravity-cli`, or the container-only one
+from `~/.gemini/agy-container-home`; neither directory is mounted into a
+job), with settings that carry only the Google Cloud project and location, and keeps agy's conversation between rounds so a
 resume works. A job therefore cannot leave a setting, a hook or a cached
 package behind for the next job, whatever repository it was reviewing. The
 patch export runs with an empty home, python in isolated mode and no user
 git configuration, so nothing a round planted in the job's home runs there.
-A `--read-dir` that overlaps the sign-in or the state directory is refused.
+A `--read-dir` that overlaps either sign-in or the state directory is refused.
 Inside the container agy runs with `--dangerously-skip-permissions`: it runs
 the commands it needs, including your tests, and edits what it likes, and
 all of that lands in the working copy. For a review, a plan or a task round
@@ -127,10 +132,10 @@ used, so `NOTICE` is unchanged.
 What the container does not change: agy still has the network, because it
 must reach Google, so a prompt injection in the repository can send out
 anything the container can read: the repository, any `--read-dir`
-directory, and the job's copy of the container sign-in. The repository
+directory, and the job's copy of the sign-in. The repository
 already goes to Google for the review, so that part is not new, but it is
-not nothing. The container sign-in is a credential like the one in your own
-`~/.gemini`; with workforce identity federation it expires with the pool's
+not nothing. The job's copy is the same credential as your own `agy`
+sign-in; with workforce identity federation it expires with the pool's
 session duration (see `NOTES.md`). And a Docker virtual machine on
 macOS shares only some directories: the plugin's state directory must be
 under your home (Colima's default share), which `/agy:setup` checks.
@@ -199,6 +204,36 @@ stops agy and everything agy started, and resumes the same conversation on
 the next model down (High to Medium, Medium to Low), up to two times.
 `/agy:status` shows each stall and the model that finished the job.
 
+An expired sign-in is not a stall. When the workforce pool's session ends,
+agy logs `"invalid_grant" "Refresh token has expired"` and retries without
+end; the runner stops the job at that line and reports a sign-in failure,
+instead of waiting for the stall timer and resuming on another model.
+
+## Failure classes and exit codes
+
+A failed job records why as `failure`, shown by `/agy:status` and
+`/agy:result`, and a command that waits for the job exits with that class's
+code. The idea, and the codes for the classes both plugins share, come from
+yuting0624/antigravity-for-claude-code.
+
+| Exit | Class         | Meaning                                                   |
+|------|---------------|-----------------------------------------------------------|
+| 0    |               | Completed, needs approval, or still running in background |
+| 1    | `agy-failed`  | agy failed for a reason no other class names              |
+| 2    |               | Usage error: a bad argument, or no git repository         |
+| 10   | `quota`       | Google refused the request for quota                      |
+| 11   | `signin`      | Not signed in, or the sign-in expired                     |
+| 12   | `timeout`     | The job ran past its time limit                           |
+| 13   | `agy-missing` | agy is not installed or not on PATH                       |
+| 14   | `model`       | agy did not recognise the model                           |
+| 15   | `licence`     | Google reclaimed the Gemini Enterprise seat               |
+| 16   | `stall`       | Still stalled after the resumes on lower models           |
+| 17   | `container`   | Docker is not running, or the image is missing            |
+
+The class comes from agy's stderr, agy's own log and its error text, never
+from the model's reply. The quota class matches Google's `RESOURCE_EXHAUSTED`
+status and HTTP 429; neither has been seen from agy here yet.
+
 ## Using a Gemini Enterprise licence
 
 See [docs/gemini-enterprise.md](docs/gemini-enterprise.md) for what an
@@ -250,9 +285,11 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
   telemetry noise.
 - **Working copies.** A review's or plan's working copy is removed when the
   job finishes, unless it is waiting on queued commands. A task's working copy
-  stays for `/agy:resume` and `/agy:apply`, until the job is pruned (the
-  newest 50 finished jobs are kept) or you run
-  `python3 scripts/agy_companion.py cleanup`. Job state lives under
+  stays for `/agy:resume` and `/agy:apply`. A finished job idle for seven
+  days, in any repository, loses its working copy and its container home;
+  its result and patch stay, so `/agy:apply` still works but `/agy:resume`
+  does not. The newest 50 finished jobs per repository are kept. To free the
+  space at once, run `python3 scripts/agy_companion.py cleanup`. Job state lives under
   `$CLAUDE_PLUGIN_DATA/state`, or the system temporary directory. The
   session-start hook exports that directory to the session as
   `AGY_COMPANION_STATE_DIR`, so commands and hooks share it.
@@ -267,11 +304,6 @@ drives `/agy:setup` and `/agy:review` through `claude --plugin-dir`.
 
 ## Open questions
 
-- **Container sign-in.** `containers/signin.sh` stores agy's sign-in in
-  `~/.gemini/agy-container-home`, so a container user signs in twice, and
-  again when the pool's session expires. `AGY_ADC_AUTH=true` (preview) with
-  Application Default Credentials would avoid the second sign-in; whether it
-  bills the Gemini Enterprise seat or pay-as-you-go is not verified.
 - **Host mode's future.** Once container mode has run live for a while, the
   host-side policy, sandbox and `/agy:resume` loop are due for removal.
 - **The Antigravity Python SDK** offers real permission callbacks, but it

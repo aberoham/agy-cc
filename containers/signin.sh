@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
-# Sign agy in for container jobs. The sign-in is interactive, so run this
-# from a real terminal. agy's OAuth token is written to the container home
-# (~/.gemini/agy-container-home, the directory `/agy:setup` names), not to
-# the host's own ~/.gemini/antigravity-cli.
+# Make a container-only agy sign-in. Usually not needed: container jobs copy
+# the newer of this sign-in and the host's own `agy` sign-in, so signing in
+# with `agy` on the host covers them. Use this when the host's agy keeps its
+# token in the keychain rather than a file. The sign-in is interactive, so
+# run this from a real terminal. agy's OAuth token is written to the
+# container home (~/.gemini/agy-container-home), not to the host's own
+# ~/.gemini/antigravity-cli.
 #
 # Environment: AGY_IMAGE (default agy-sandbox:experiment), AGY_CONTAINER_HOME
 # (another container home), AGY_WIF_PROVIDER (the workforce provider string;
@@ -18,9 +21,13 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 image="${AGY_IMAGE:-agy-sandbox:experiment}"
 host_settings="${HOME}/.gemini/antigravity-cli/settings.json"
 
-if [[ -z "${DOCKER_HOST:-}" ]] && docker context inspect colima >/dev/null 2>&1; then
-    DOCKER_HOST="$(docker context inspect --format '{{.Endpoints.docker.Host}}' colima)"
-    export DOCKER_HOST
+# Docker and the image are checked before the old sign-in is removed below,
+# so a stopped daemon never costs the user their existing sign-in.
+# shellcheck source=containers/docker-up.sh
+source "${here}/containers/docker-up.sh"
+if ! docker image inspect "${image}" >/dev/null 2>&1; then
+    echo "The image ${image} is missing; building it."
+    "${here}/containers/build.sh"
 fi
 
 home="$(/usr/bin/python3 - "${here}" <<'EOF'
