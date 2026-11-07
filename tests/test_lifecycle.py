@@ -465,3 +465,18 @@ def test_pruning_and_expiry_recheck_the_status_under_the_job_lock(companion, rep
     assert not state.drop_finished_working_copy(store.job_dir(job["id"]))
     store._remove_job(job["id"])
     assert Path(job["worktree"]).is_dir() and (store.job_dir(job["id"]) / "job.json").is_file()
+
+
+def test_resume_refuses_a_record_with_no_working_copy_recorded(companion, repo, monkeypatch):
+    from agylib import state
+
+    monkeypatch.setenv("AGY_COMPANION_STATE_DIR", companion.env["AGY_COMPANION_STATE_DIR"])
+    companion.run("task", NO_SANDBOX, "fix it", scenario="task")
+    job = companion.job()
+    store = state.JobStore(repo)
+    store.update(job["id"], lambda r: r.pop("worktree"))
+    results = repo.parent / "results.md"
+    results.write_text("more\n")
+    proc = companion.run("resume", job["id"], str(results), NO_SANDBOX, check=False)
+    assert "working copy no longer exists" in proc.stdout + proc.stderr
+    assert companion.job()["status"] == job["status"]

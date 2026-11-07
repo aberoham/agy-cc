@@ -235,6 +235,16 @@ def main() -> int:
         time.sleep(3600)
         return 0
 
+    if scenario == "session-expired-chatty":
+        # agy keeps emitting events but never a result after the session ends.
+        if log_file:
+            with open(log_file, "a") as log:
+                log.write('oauth2: "invalid_grant" "Refresh token has expired"\n')
+        for index in range(1, 100000):
+            emit({"event": "step_update", "step_update": {"conversation_id": conversation, "step_index": index}})
+            time.sleep(0.2)
+        return 0
+
     if scenario == "result-then-session-expired":
         # The answer is already on stdout when the log reports the expiry.
         if log_file:

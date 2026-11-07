@@ -111,3 +111,10 @@ def test_a_result_already_on_stdout_wins_over_a_later_expired_session(companion)
     assert proc.returncode == 0, proc.stdout + proc.stderr
     job = companion.job()
     assert job["status"] == "completed" and job.get("failure") is None
+
+
+def test_an_expired_session_ends_the_turn_even_while_agy_keeps_emitting_events(companion):
+    started = time.monotonic()
+    proc = companion.run("review", NO_SANDBOX, scenario="session-expired-chatty", check=False)
+    assert proc.returncode == 11
+    assert time.monotonic() - started < 60

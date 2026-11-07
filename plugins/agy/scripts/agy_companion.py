@@ -384,7 +384,8 @@ def continue_job(
         if record.get("status") in ACTIVE_STATUSES:
             raise UsageError(f"Job {job_id} is still running.")
         # Checked under the lock that cleanup and expiry also take.
-        if not Path(record.get("worktree") or "").is_dir():
+        worktree = record.get("worktree")
+        if not worktree or not Path(worktree).is_dir():
             raise UsageError(f"Job {job_id}'s working copy no longer exists; start a new job.")
         finished = parse_iso(record.get("completed_at"))
         record.update(

@@ -140,6 +140,7 @@ def _follow(
     result: dict[str, Any] | None = None
     log_tail = ""
     log_outcome: TurnOutcome | None = None
+    log_seen = 0.0
     with open(events_path, "a", encoding="utf-8") as events:
         while True:
             try:
@@ -179,11 +180,13 @@ def _follow(
                 window = log_tail + chunk
                 log_tail = window[-LOG_TAIL_CHARS:]
                 log_outcome = _log_outcome(window)
+                log_seen = now
             if result is not None:
                 log_outcome = None
-            elif log_outcome is not None and not line:
-                # Act on the log only once agy's output has gone quiet, so a
-                # result already written to stdout is never thrown away.
+            elif log_outcome is not None and (not line or now - log_seen > LOG_DRAIN_SECONDS):
+                # Act on the log once agy's output has gone quiet, so a result
+                # already written to stdout is never thrown away, or after a
+                # short wait if agy keeps emitting events without a result.
                 return log_outcome
     if result is None and log_outcome is not None:
         return log_outcome
@@ -202,6 +205,8 @@ def _follow(
 
 
 LOG_TAIL_CHARS = 512
+# How long a log outcome waits for a result while agy keeps emitting events.
+LOG_DRAIN_SECONDS = 10.0
 
 
 def _log_outcome(text: str) -> TurnOutcome | None:
