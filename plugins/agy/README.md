@@ -30,7 +30,7 @@ works on its own copy of your repository, so agy never edits your checkout.
 This repository is its own marketplace. Add it, then install the plugin:
 
 ```
-/plugin marketplace add aberoham/agy-cc
+/plugin marketplace add aberoham/contained-antigravity-for-claude-code
 /plugin install agy@agy-cc
 ```
 
@@ -41,6 +41,10 @@ From another marketplace that lists this plugin:
 ```
 
 To update later: `/plugin marketplace update agy-cc`.
+
+The repository was called `aberoham/agy-cc` until November 2026. GitHub
+redirects the old name, and the marketplace keeps the name `agy-cc`, so an
+existing install needs no change.
 
 To try a local checkout: `claude --plugin-dir plugins/agy`.
 
